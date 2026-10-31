@@ -6,6 +6,7 @@ import { BarangPage } from "@/features/barang/BarangPage";
 import { InventoriPage } from "@/features/inventori/InventoriPage";
 import { PembelianPage } from "@/features/pembelian/PembelianPage";
 import { UtangPage } from "@/features/utang/UtangPage";
+import { PengaturanPage } from "@/features/pengaturan/PengaturanPage";
 import { formatRupiah } from "@/lib/utils";
 import {
   TrendingUp,
@@ -37,12 +38,14 @@ export function App() {
       {activeTab === "inventori" && <InventoriPage />}
       {activeTab === "pembelian" && <PembelianPage />}
       {activeTab === "utang" && <UtangPage />}
+      {activeTab === "pengaturan" && <PengaturanPage currentUser={currentUser} />}
       {activeTab !== "dashboard" &&
         activeTab !== "kasir" &&
         activeTab !== "barang" &&
         activeTab !== "inventori" &&
         activeTab !== "pembelian" &&
-        activeTab !== "utang" && (
+        activeTab !== "utang" &&
+        activeTab !== "pengaturan" && (
           <GenericModulePlaceholder title={activeTab} />
         )}
     </AppLayout>

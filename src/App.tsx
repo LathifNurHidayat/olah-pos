@@ -1,6 +1,7 @@
 import { useState } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { LoginPage, type UserSession } from "@/features/auth/LoginPage";
+import { BarangPage } from "@/features/barang/BarangPage";
 import { formatRupiah } from "@/lib/utils";
 import {
   TrendingUp,
@@ -31,7 +32,8 @@ export function App() {
     >
       {activeTab === "dashboard" && <DashboardView user={currentUser} />}
       {activeTab === "kasir" && <KasirPreviewView />}
-      {activeTab !== "dashboard" && activeTab !== "kasir" && (
+      {activeTab === "barang" && <BarangPage />}
+      {activeTab !== "dashboard" && activeTab !== "kasir" && activeTab !== "barang" && (
         <GenericModulePlaceholder title={activeTab} />
       )}
     </AppLayout>

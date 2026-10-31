@@ -57,7 +57,14 @@ pub fn run() {
         .invoke_handler(tauri::generate_handler![
             get_system_status,
             commands::auth::login,
-            commands::auth::change_password
+            commands::auth::change_password,
+            commands::master::get_barang_list,
+            commands::master::save_barang,
+            commands::master::delete_barang,
+            commands::master::get_kategori_list,
+            commands::master::get_satuan_list,
+            commands::master::get_supplier_list,
+            commands::master::get_jenis_mutasi_list
         ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");

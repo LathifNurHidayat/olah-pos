@@ -64,7 +64,11 @@ pub fn run() {
             commands::master::get_kategori_list,
             commands::master::get_satuan_list,
             commands::master::get_supplier_list,
-            commands::master::get_jenis_mutasi_list
+            commands::master::get_jenis_mutasi_list,
+            commands::inventory::get_inventory_overview,
+            commands::inventory::get_inventory_stats,
+            commands::inventory::get_stock_mutations,
+            commands::inventory::process_stock_opname
         ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");

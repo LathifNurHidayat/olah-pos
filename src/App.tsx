@@ -3,6 +3,8 @@ import { AppLayout } from "@/components/layout/AppLayout";
 import { LoginPage, type UserSession } from "@/features/auth/LoginPage";
 import { BarangPage } from "@/features/barang/BarangPage";
 import { InventoriPage } from "@/features/inventori/InventoriPage";
+import { PembelianPage } from "@/features/pembelian/PembelianPage";
+import { UtangPage } from "@/features/utang/UtangPage";
 import { formatRupiah } from "@/lib/utils";
 import {
   TrendingUp,
@@ -35,10 +37,14 @@ export function App() {
       {activeTab === "kasir" && <KasirPreviewView />}
       {activeTab === "barang" && <BarangPage />}
       {activeTab === "inventori" && <InventoriPage />}
+      {activeTab === "pembelian" && <PembelianPage />}
+      {activeTab === "utang" && <UtangPage />}
       {activeTab !== "dashboard" &&
         activeTab !== "kasir" &&
         activeTab !== "barang" &&
-        activeTab !== "inventori" && (
+        activeTab !== "inventori" &&
+        activeTab !== "pembelian" &&
+        activeTab !== "utang" && (
           <GenericModulePlaceholder title={activeTab} />
         )}
     </AppLayout>

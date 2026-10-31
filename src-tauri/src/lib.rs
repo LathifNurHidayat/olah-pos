@@ -68,7 +68,13 @@ pub fn run() {
             commands::inventory::get_inventory_overview,
             commands::inventory::get_inventory_stats,
             commands::inventory::get_stock_mutations,
-            commands::inventory::process_stock_opname
+            commands::inventory::process_stock_opname,
+            commands::purchase::create_pembelian,
+            commands::purchase::get_pembelian_list,
+            commands::purchase::get_detail_pembelian,
+            commands::purchase::get_utang_list,
+            commands::purchase::bayar_utang,
+            commands::purchase::get_pembayaran_utang_history
         ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");

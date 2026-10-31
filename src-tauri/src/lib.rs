@@ -1,8 +1,10 @@
+pub mod commands;
 pub mod database;
 pub mod services;
 
 use database::connection::{DatabasePaths, DbManager};
 use database::migrator::Migrator;
+use services::auth::AuthService;
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -37,18 +39,26 @@ pub fn run() {
                 .map_err(|e| format!("Failed to initialize database: {}", e))?;
 
             // Run pending migrations automatically
+            let conn_arc = db_manager.get_connection();
             {
-                let conn_arc = db_manager.get_connection();
                 let mut conn = conn_arc.lock().unwrap();
                 Migrator::run(&mut conn)
                     .map_err(|e| format!("Failed to run database migrations: {}", e))?;
             }
 
+            // Bootstrap developer account securely if no active users exist
+            AuthService::bootstrap_developer_if_needed(&conn_arc)
+                .map_err(|e| format!("Failed to bootstrap developer account: {}", e))?;
+
             app.manage(Arc::new(db_manager));
-            log::info!("OlahPOS backend, database and migrations ready");
+            log::info!("OlahPOS backend, database, migrations and auth ready");
             Ok(())
         })
-        .invoke_handler(tauri::generate_handler![get_system_status])
+        .invoke_handler(tauri::generate_handler![
+            get_system_status,
+            commands::auth::login,
+            commands::auth::change_password
+        ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");
 }

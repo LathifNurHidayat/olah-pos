@@ -1,5 +1,6 @@
 import { useState } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
+import { LoginPage, type UserSession } from "@/features/auth/LoginPage";
 import { formatRupiah } from "@/lib/utils";
 import {
   TrendingUp,
@@ -14,11 +15,21 @@ import {
 } from "lucide-react";
 
 export function App() {
+  const [currentUser, setCurrentUser] = useState<UserSession | null>(null);
   const [activeTab, setActiveTab] = useState("dashboard");
 
+  if (!currentUser) {
+    return <LoginPage onLoginSuccess={setCurrentUser} />;
+  }
+
   return (
-    <AppLayout activeTab={activeTab} onSelectTab={setActiveTab}>
-      {activeTab === "dashboard" && <DashboardView />}
+    <AppLayout
+      activeTab={activeTab}
+      onSelectTab={setActiveTab}
+      currentUser={currentUser}
+      onLogout={() => setCurrentUser(null)}
+    >
+      {activeTab === "dashboard" && <DashboardView user={currentUser} />}
       {activeTab === "kasir" && <KasirPreviewView />}
       {activeTab !== "dashboard" && activeTab !== "kasir" && (
         <GenericModulePlaceholder title={activeTab} />
@@ -27,7 +38,7 @@ export function App() {
   );
 }
 
-function DashboardView() {
+function DashboardView({ user }: { user: UserSession }) {
   return (
     <div className="space-y-6">
       {/* Top Banner */}
@@ -36,8 +47,12 @@ function DashboardView() {
           <span>OlahPOS v1.0 Desktop</span>
           <span>•</span>
           <span className="text-emerald-400">Local-First Engine</span>
+          <span>•</span>
+          <span className="text-indigo-200">Peran: {user.peran}</span>
         </div>
-        <h2 className="text-2xl font-bold tracking-tight">Selamat Datang di OlahPOS</h2>
+        <h2 className="text-2xl font-bold tracking-tight">
+          Selamat Datang, {user.nama_lengkap}
+        </h2>
         <p className="text-sm text-indigo-200 max-w-2xl">
           Sistem kasir dan manajemen inventori lokal berkecepatan tinggi dengan dual SQLite database dan pencatatan audit log otomatis.
         </p>

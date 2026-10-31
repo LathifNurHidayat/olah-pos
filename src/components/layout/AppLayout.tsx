@@ -14,8 +14,10 @@ import {
   Bell,
   UserCheck,
   ShieldCheck,
+  LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
+import type { UserSession } from "@/features/auth/LoginPage";
 
 export type NavItem = {
   id: string;
@@ -39,12 +41,16 @@ const NAV_ITEMS: NavItem[] = [
 interface AppLayoutProps {
   activeTab: string;
   onSelectTab: (tabId: string) => void;
+  currentUser?: UserSession;
+  onLogout?: () => void;
   children: React.ReactNode;
 }
 
 export const AppLayout: React.FC<AppLayoutProps> = ({
   activeTab,
   onSelectTab,
+  currentUser,
+  onLogout,
   children,
 }) => {
   const [sidebarOpen, setSidebarOpen] = useState(true);
@@ -111,7 +117,7 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
           })}
         </nav>
 
-        {/* User Pill Footer */}
+        {/* User Pill Footer with Logout */}
         <div className="border-t border-slate-100 p-3 dark:border-slate-800/80">
           <div
             className={cn(
@@ -125,13 +131,22 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
             {sidebarOpen && (
               <div className="flex flex-col min-w-0 flex-1">
                 <span className="truncate text-xs font-semibold text-slate-800 dark:text-slate-200">
-                  Administrator
+                  {currentUser?.nama_lengkap ?? "Administrator"}
                 </span>
                 <span className="truncate text-[10px] text-emerald-600 dark:text-emerald-400 font-medium flex items-center gap-1">
                   <span className="h-1.5 w-1.5 rounded-full bg-emerald-500 animate-pulse"></span>
-                  Local-First Aktif
+                  {currentUser?.peran ?? "ADMIN"} • Local Aktif
                 </span>
               </div>
+            )}
+            {sidebarOpen && onLogout && (
+              <button
+                onClick={onLogout}
+                className="rounded-lg p-1.5 text-slate-400 hover:bg-rose-50 hover:text-rose-600 dark:hover:bg-rose-950/40 dark:hover:text-rose-400 transition-colors"
+                title="Keluar"
+              >
+                <LogOut className="h-4 w-4" />
+              </button>
             )}
           </div>
         </div>

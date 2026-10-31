@@ -2,6 +2,7 @@ pub mod database;
 pub mod services;
 
 use database::connection::{DatabasePaths, DbManager};
+use database::migrator::Migrator;
 use std::sync::Arc;
 use tauri::Manager;
 
@@ -35,8 +36,16 @@ pub fn run() {
             let db_manager = DbManager::init(db_paths)
                 .map_err(|e| format!("Failed to initialize database: {}", e))?;
 
+            // Run pending migrations automatically
+            {
+                let conn_arc = db_manager.get_connection();
+                let mut conn = conn_arc.lock().unwrap();
+                Migrator::run(&mut conn)
+                    .map_err(|e| format!("Failed to run database migrations: {}", e))?;
+            }
+
             app.manage(Arc::new(db_manager));
-            log::info!("OlahPOS backend & dual-database initialized successfully");
+            log::info!("OlahPOS backend, database and migrations ready");
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![get_system_status])

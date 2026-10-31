@@ -74,7 +74,10 @@ pub fn run() {
             commands::purchase::get_detail_pembelian,
             commands::purchase::get_utang_list,
             commands::purchase::bayar_utang,
-            commands::purchase::get_pembayaran_utang_history
+            commands::purchase::get_pembayaran_utang_history,
+            commands::sales::process_checkout,
+            commands::sales::get_penjualan_list,
+            commands::sales::get_receipt_detail
         ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");

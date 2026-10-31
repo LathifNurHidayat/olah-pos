@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { AppLayout } from "@/components/layout/AppLayout";
 import { LoginPage, type UserSession } from "@/features/auth/LoginPage";
 import { KasirPage } from "@/features/kasir/KasirPage";
@@ -6,6 +6,7 @@ import { BarangPage } from "@/features/barang/BarangPage";
 import { InventoriPage } from "@/features/inventori/InventoriPage";
 import { PembelianPage } from "@/features/pembelian/PembelianPage";
 import { UtangPage } from "@/features/utang/UtangPage";
+import { LaporanPage } from "@/features/laporan/LaporanPage";
 import { PengaturanPage } from "@/features/pengaturan/PengaturanPage";
 import { formatRupiah } from "@/lib/utils";
 import {
@@ -15,6 +16,7 @@ import {
   Plus,
   ArrowUpRight,
   ArrowDownLeft,
+  Coins,
 } from "lucide-react";
 
 export function App() {
@@ -38,6 +40,7 @@ export function App() {
       {activeTab === "inventori" && <InventoriPage />}
       {activeTab === "pembelian" && <PembelianPage />}
       {activeTab === "utang" && <UtangPage />}
+      {activeTab === "laporan" && <LaporanPage />}
       {activeTab === "pengaturan" && <PengaturanPage currentUser={currentUser} />}
       {activeTab !== "dashboard" &&
         activeTab !== "kasir" &&
@@ -45,6 +48,7 @@ export function App() {
         activeTab !== "inventori" &&
         activeTab !== "pembelian" &&
         activeTab !== "utang" &&
+        activeTab !== "laporan" &&
         activeTab !== "pengaturan" && (
           <GenericModulePlaceholder title={activeTab} />
         )}
@@ -53,6 +57,48 @@ export function App() {
 }
 
 function DashboardView({ user }: { user: UserSession }) {
+  const [stats, setStats] = useState({
+    omset_hari_ini: 0,
+    transaksi_hari_ini: 0,
+    omset_bulan_ini: 0,
+    laba_kotor_hari_ini: 0,
+    total_barang_aktif: 0,
+    stok_menipis: 0,
+    stok_habis: 0,
+    sisa_utang: 0,
+    kas_masuk_hari_ini: 0,
+    kas_keluar_hari_ini: 0,
+  });
+
+  useEffect(() => {
+    const loadDashboard = async () => {
+      if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+        try {
+          const { invoke } = await import("@tauri-apps/api/core");
+          const data = await invoke<any>("get_dashboard_summary");
+          setStats(data);
+        } catch (e) {
+          console.error("Gagal load summary dashboard:", e);
+        }
+      } else {
+        // Fallback demo numbers
+        setStats({
+          omset_hari_ini: 2450000,
+          transaksi_hari_ini: 18,
+          omset_bulan_ini: 15400000,
+          laba_kotor_hari_ini: 780000,
+          total_barang_aktif: 142,
+          stok_menipis: 3,
+          stok_habis: 1,
+          sisa_utang: 850000,
+          kas_masuk_hari_ini: 2450000,
+          kas_keluar_hari_ini: 500000,
+        });
+      }
+    };
+    loadDashboard();
+  }, []);
+
   return (
     <div className="space-y-6">
       {/* Top Banner */}
@@ -85,10 +131,10 @@ function DashboardView({ user }: { user: UserSession }) {
           </div>
           <div className="mt-3">
             <span className="text-2xl font-bold text-slate-900 dark:text-white">
-              {formatRupiah(2450000)}
+              {formatRupiah(stats.omset_hari_ini)}
             </span>
             <span className="mt-1 flex items-center gap-1 text-xs text-emerald-600 font-medium">
-              <ArrowUpRight className="h-3.5 w-3.5" /> 18 Transaksi Berhasil
+              <ArrowUpRight className="h-3.5 w-3.5" /> {stats.transaksi_hari_ini} Transaksi Berhasil
             </span>
           </div>
         </div>
@@ -103,9 +149,11 @@ function DashboardView({ user }: { user: UserSession }) {
             </div>
           </div>
           <div className="mt-3">
-            <span className="text-2xl font-bold text-slate-900 dark:text-white">142</span>
+            <span className="text-2xl font-bold text-slate-900 dark:text-white">
+              {stats.total_barang_aktif}
+            </span>
             <span className="mt-1 text-xs text-slate-400 block font-medium">
-              Tercakup dalam 8 Kategori
+              Katalog SKU Terdaftar
             </span>
           </div>
         </div>
@@ -113,16 +161,18 @@ function DashboardView({ user }: { user: UserSession }) {
         <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
           <div className="flex items-center justify-between">
             <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
-              Stok Menipis
+              Stok Menipis / Habis
             </span>
             <div className="rounded-xl bg-amber-50 p-2 text-amber-600 dark:bg-amber-950/60 dark:text-amber-400">
               <AlertTriangle className="h-4 w-4" />
             </div>
           </div>
           <div className="mt-3">
-            <span className="text-2xl font-bold text-slate-900 dark:text-white">3</span>
+            <span className="text-2xl font-bold text-slate-900 dark:text-white">
+              {stats.stok_menipis + stats.stok_habis}
+            </span>
             <span className="mt-1 text-xs text-amber-600 font-medium block">
-              Perlu pengadaan segera
+              {stats.stok_habis} habis, {stats.stok_menipis} menipis
             </span>
           </div>
         </div>
@@ -138,10 +188,51 @@ function DashboardView({ user }: { user: UserSession }) {
           </div>
           <div className="mt-3">
             <span className="text-2xl font-bold text-slate-900 dark:text-white">
-              {formatRupiah(850000)}
+              {formatRupiah(stats.sisa_utang)}
             </span>
             <span className="mt-1 text-xs text-slate-400 font-medium block">
-              2 Faktur Tempo Pekan Ini
+              Total tagihan supplier belum lunas
+            </span>
+          </div>
+        </div>
+      </div>
+
+      {/* Row 2: Laba Kotor & Arus Kas */}
+      <div className="grid grid-cols-1 sm:grid-cols-2 gap-4">
+        <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+              Estimasi Laba Kotor Hari Ini
+            </span>
+            <div className="rounded-xl bg-emerald-50 p-2 text-emerald-600 dark:bg-emerald-950/60 dark:text-emerald-400">
+              <Coins className="h-4 w-4" />
+            </div>
+          </div>
+          <div className="mt-3">
+            <span className="text-2xl font-bold text-emerald-600 dark:text-emerald-400">
+              {formatRupiah(stats.laba_kotor_hari_ini)}
+            </span>
+            <span className="mt-1 text-xs text-slate-400 block font-medium">
+              Margin kotor setelah dikurangi HPP produk terjual
+            </span>
+          </div>
+        </div>
+
+        <div className="rounded-2xl border border-slate-200/80 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+          <div className="flex items-center justify-between">
+            <span className="text-xs font-semibold uppercase tracking-wider text-slate-400">
+              Omset Penjualan Bulan Ini
+            </span>
+            <div className="rounded-xl bg-indigo-50 p-2 text-indigo-600 dark:bg-indigo-950/60 dark:text-indigo-400">
+              <TrendingUp className="h-4 w-4" />
+            </div>
+          </div>
+          <div className="mt-3">
+            <span className="text-2xl font-bold text-indigo-600 dark:text-indigo-400">
+              {formatRupiah(stats.omset_bulan_ini)}
+            </span>
+            <span className="mt-1 text-xs text-slate-400 block font-medium">
+              Total penerimaan kasir pada bulan berjalan
             </span>
           </div>
         </div>

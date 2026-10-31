@@ -80,7 +80,11 @@ pub fn run() {
             commands::sales::get_receipt_detail,
             commands::integration::save_integration_config,
             commands::integration::get_integration_config,
-            commands::integration::generate_qris
+            commands::integration::generate_qris,
+            commands::report::get_dashboard_summary,
+            commands::report::get_sales_report,
+            commands::report::get_cash_flow_report,
+            commands::report::get_product_profit_report
         ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");

@@ -14,6 +14,7 @@ import {
   Bell,
   UserCheck,
   ShieldCheck,
+  Terminal,
   LogOut,
 } from "lucide-react";
 import { cn } from "@/lib/utils";
@@ -24,6 +25,7 @@ export type NavItem = {
   label: string;
   icon: React.ElementType;
   badge?: string;
+  developerOnly?: boolean;
 };
 
 const NAV_ITEMS: NavItem[] = [
@@ -36,6 +38,7 @@ const NAV_ITEMS: NavItem[] = [
   { id: "laporan", label: "Laporan & Keuangan", icon: FileBarChart },
   { id: "backup", label: "Backup & Restore", icon: HardDriveDownload },
   { id: "pengaturan", label: "Pengaturan", icon: Settings },
+  { id: "developer", label: "Menu Developer", icon: Terminal, developerOnly: true },
 ];
 
 interface AppLayoutProps {
@@ -91,6 +94,12 @@ export const AppLayout: React.FC<AppLayoutProps> = ({
         {/* Navigation Links */}
         <nav className="flex-1 space-y-1 overflow-y-auto px-3 py-4">
           {NAV_ITEMS.map((item) => {
+            const isDeveloper =
+              currentUser?.nama_pengguna === "developer" || currentUser?.peran === "ADMIN";
+            if (item.developerOnly && !isDeveloper) {
+              return null;
+            }
+
             const Icon = item.icon;
             const isActive = activeTab === item.id;
             return (

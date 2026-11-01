@@ -91,7 +91,19 @@ pub fn run() {
             commands::backup::create_database_backup,
             commands::backup::list_database_backups,
             commands::backup::restore_database_backup,
-            commands::backup::setup_backup_scheduler
+            commands::backup::setup_backup_scheduler,
+            commands::developer::get_system_diagnostics,
+            commands::developer::get_audit_tables,
+            commands::developer::get_developer_audit_logs,
+            commands::developer::get_runtime_logs,
+            commands::developer::export_system_logs,
+            commands::developer::record_client_error,
+            commands::developer::execute_developer_query,
+            commands::developer::developer_list_users,
+            commands::developer::developer_create_user,
+            commands::developer::developer_reset_password,
+            commands::developer::developer_toggle_user_status,
+            commands::developer::developer_update_user_role
         ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");

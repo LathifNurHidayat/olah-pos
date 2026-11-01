@@ -35,6 +35,47 @@ pub struct BackupManifest {
     pub log_db_size: u64,
 }
 
+#[derive(Debug)]
+pub enum BackupEntryError {
+    /// Data backup tidak valid, korup, ukuran mismatch, created_at tidak valid, atau symlink
+    Invalid(String),
+    /// Error filesystem / I/O dari OS (PermissionDenied, disk fault, dll.) yang harus menghentikan operasi
+    Io(std::io::Error),
+}
+
+impl std::fmt::Display for BackupEntryError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            BackupEntryError::Invalid(msg) => write!(f, "Invalid backup: {}", msg),
+            BackupEntryError::Io(err) => write!(f, "Filesystem error: {}", err),
+        }
+    }
+}
+
+impl std::error::Error for BackupEntryError {}
+
+impl From<std::io::Error> for BackupEntryError {
+    fn from(err: std::io::Error) -> Self {
+        BackupEntryError::Io(err)
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct ValidatedBackup {
+    pub manifest: BackupManifest,
+    pub created_at_ts: i64,
+}
+
+fn is_sqlite_io_or_perm_error(code: rusqlite::ffi::ErrorCode) -> bool {
+    matches!(
+        code,
+        rusqlite::ffi::ErrorCode::PermissionDenied
+            | rusqlite::ffi::ErrorCode::CannotOpen
+            | rusqlite::ffi::ErrorCode::SystemIoFailure
+            | rusqlite::ffi::ErrorCode::DiskFull
+    )
+}
+
 /// RAII Guard untuk memastikan folder staging otomatis dibersihkan jika proses backup gagal
 struct StagingGuard<'a> {
     path: &'a Path,
@@ -43,7 +84,7 @@ struct StagingGuard<'a> {
 
 impl<'a> Drop for StagingGuard<'a> {
     fn drop(&mut self) {
-        if !self.committed && self.path.exists() {
+        if !self.committed && fs::symlink_metadata(self.path).is_ok() {
             let _ = fs::remove_dir_all(self.path);
         }
     }
@@ -57,8 +98,25 @@ impl BackupService {
     pub fn get_backups_dir() -> std::io::Result<PathBuf> {
         let app_dir = get_app_data_dir()?;
         let backups_dir = app_dir.join("backups");
-        if !backups_dir.exists() {
-            fs::create_dir_all(&backups_dir)?;
+        match fs::symlink_metadata(&backups_dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Direktori backup {:?} adalah symbolic link", backups_dir),
+                    ));
+                }
+                if !meta.is_dir() {
+                    return Err(std::io::Error::new(
+                        std::io::ErrorKind::InvalidInput,
+                        format!("Path backup {:?} bukan direktori", backups_dir),
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(&backups_dir)?;
+            }
+            Err(e) => return Err(e),
         }
         Ok(backups_dir)
     }
@@ -146,33 +204,102 @@ impl BackupService {
         Ok(())
     }
 
-    /// Memvalidasi berkas database SQLite: keberadaan, ukuran > 0, bisa dibuka, dan lulus integrity_check
-    pub fn validate_sqlite_database(path: &Path) -> Result<u64, String> {
-        if !path.exists() {
-            return Err(format!("File database tidak ditemukan: {:?}", path));
+    /// Memvalidasi berkas database SQLite: bukan symbolic link, file reguler, ukuran > 0, bisa dibuka, dan lulus integrity_check
+    pub fn validate_sqlite_database(path: &Path) -> Result<u64, BackupEntryError> {
+        let meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackupEntryError::Invalid(format!(
+                    "File database tidak ditemukan: {:?}",
+                    path
+                )));
+            }
+            Err(e) => return Err(BackupEntryError::Io(e)),
+        };
+
+        let file_type = meta.file_type();
+        if file_type.is_symlink() {
+            return Err(BackupEntryError::Invalid(format!(
+                "File database {:?} adalah symbolic link, ditolak",
+                path
+            )));
         }
-        let metadata = fs::metadata(path)
-            .map_err(|e| format!("Gagal membaca metadata file {:?}: {}", path, e))?;
-        let size = metadata.len();
-        if size == 0 {
-            return Err(format!("File database kosong (0 bytes): {:?}", path));
+        if !file_type.is_file() {
+            return Err(BackupEntryError::Invalid(format!(
+                "File database {:?} bukan file reguler",
+                path
+            )));
         }
 
-        let conn = Connection::open_with_flags(
+        let size = meta.len();
+        if size == 0 {
+            return Err(BackupEntryError::Invalid(format!(
+                "File database kosong (0 bytes): {:?}",
+                path
+            )));
+        }
+
+        let conn = match Connection::open_with_flags(
             path,
             rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
-        )
-        .map_err(|e| format!("File bukan database SQLite yang valid ({:?}): {}", path, e))?;
+        ) {
+            Ok(c) => c,
+            Err(rusqlite::Error::SqliteFailure(err, msg)) => {
+                if is_sqlite_io_or_perm_error(err.code) {
+                    return Err(BackupEntryError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "SQLite I/O error saat membuka {:?}: {:?} ({:?})",
+                            path, err, msg
+                        ),
+                    )));
+                }
+                return Err(BackupEntryError::Invalid(format!(
+                    "File bukan database SQLite yang valid ({:?}): {:?} ({:?})",
+                    path, err, msg
+                )));
+            }
+            Err(e) => {
+                return Err(BackupEntryError::Invalid(format!(
+                    "File bukan database SQLite yang valid ({:?}): {}",
+                    path, e
+                )));
+            }
+        };
 
-        let integrity: String = conn
-            .query_row("PRAGMA integrity_check;", [], |r| r.get(0))
-            .map_err(|e| format!("Gagal menjalankan integrity_check pada {:?}: {}", path, e))?;
+        let integrity_res: Result<String, rusqlite::Error> =
+            conn.query_row("PRAGMA integrity_check;", [], |r| r.get(0));
 
-        if integrity != "ok" {
-            return Err(format!(
-                "Database integrity_check gagal pada {:?}: {}",
-                path, integrity
-            ));
+        match integrity_res {
+            Ok(integrity) => {
+                if integrity != "ok" {
+                    return Err(BackupEntryError::Invalid(format!(
+                        "Database integrity_check gagal pada {:?}: {}",
+                        path, integrity
+                    )));
+                }
+            }
+            Err(rusqlite::Error::SqliteFailure(err, msg)) => {
+                if is_sqlite_io_or_perm_error(err.code) {
+                    return Err(BackupEntryError::Io(std::io::Error::new(
+                        std::io::ErrorKind::Other,
+                        format!(
+                            "SQLite I/O error saat integrity_check {:?}: {:?} ({:?})",
+                            path, err, msg
+                        ),
+                    )));
+                }
+                return Err(BackupEntryError::Invalid(format!(
+                    "Gagal menjalankan integrity_check pada {:?}: {:?} ({:?})",
+                    path, err, msg
+                )));
+            }
+            Err(e) => {
+                return Err(BackupEntryError::Invalid(format!(
+                    "Gagal menjalankan integrity_check pada {:?}: {}",
+                    path, e
+                )));
+            }
         }
 
         Ok(size)
@@ -184,9 +311,31 @@ impl BackupService {
         db: &DbConnection,
         backups_dir: &Path,
     ) -> std::result::Result<BackupResult, String> {
-        if !backups_dir.exists() {
-            fs::create_dir_all(backups_dir)
-                .map_err(|e| format!("Gagal membuat direktori backups: {}", e))?;
+        match fs::symlink_metadata(backups_dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "Direktori backup {:?} adalah symbolic link, ditolak",
+                        backups_dir
+                    ));
+                }
+                if !meta.is_dir() {
+                    return Err(format!(
+                        "Path backup {:?} bukan sebuah direktori",
+                        backups_dir
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                fs::create_dir_all(backups_dir)
+                    .map_err(|e| format!("Gagal membuat direktori backups: {}", e))?;
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Gagal memeriksa direktori backup {:?}: {}",
+                    backups_dir, e
+                ));
+            }
         }
 
         // 1. Generate ID & buat direktori staging secara eksklusif (anti-collision atomic)
@@ -206,7 +355,7 @@ impl BackupService {
             let candidate_staging = backups_dir.join(format!(".staging_{}", candidate_id));
 
             // Jika folder backup final dengan nama ini sudah ada, cari ID berikutnya
-            if target_dir.exists() {
+            if fs::symlink_metadata(&target_dir).is_ok() {
                 continue;
             }
 
@@ -278,8 +427,10 @@ impl BackupService {
         }
 
         // 3. Validasi kedua database hasil backup secara mendalam (harus valid SQLite & integrity "ok")
-        let main_db_size = Self::validate_sqlite_database(&target_main_db)?;
-        let log_db_size = Self::validate_sqlite_database(&target_log_db)?;
+        let main_db_size =
+            Self::validate_sqlite_database(&target_main_db).map_err(|e| e.to_string())?;
+        let log_db_size =
+            Self::validate_sqlite_database(&target_log_db).map_err(|e| e.to_string())?;
         let total_size = main_db_size + log_db_size;
 
         // 4. Buat manifest.json dengan versi aplikasi riil dari Cargo.toml
@@ -330,167 +481,378 @@ impl BackupService {
         Self::create_backup_snapshot_in(db, &backups_dir)
     }
 
-    /// Memvalidasi kelayakan entri backup untuk kebijakan retensi sesuai 6 kriteria:
-    /// 1. Manifest dapat dibaca
-    /// 2. Manifest dapat di-parse sebagai JSON valid
-    /// 3. backup_id manifest sesuai dengan nama folder
-    /// 4. Kedua file database (kasir_pos.db & kasir_pos_log.db) tersedia
-    /// 5. Kedua database lolos validate_sqlite_database()
-    /// 6. Ukuran aktual database sesuai dengan metadata manifest
-    pub fn is_backup_entry_valid(path: &Path, folder_name: &str) -> bool {
+    /// Memvalidasi kelayakan entri backup sesuai kriteria keamanan data & filesystem:
+    /// 1. Direktori backup adalah direktori reguler, bukan symbolic link.
+    /// 2. manifest.json adalah file reguler, bukan symbolic link, dan dapat dibaca.
+    /// 3. manifest.json dapat di-parse sebagai JSON valid.
+    /// 4. backup_id manifest sesuai dengan nama direktori.
+    /// 5. created_at manifest adalah format RFC 3339 valid dan tidak kosong.
+    /// 6. Kedua file database (kasir_pos.db & kasir_pos_log.db) adalah file reguler, bukan symbolic link.
+    /// 7. Kedua database lolos validasi SQLite (open & PRAGMA integrity_check == "ok").
+    /// 8. Ukuran aktual database sesuai dengan metadata manifest.
+    pub fn validate_backup_entry(
+        path: &Path,
+        folder_name: &str,
+    ) -> Result<ValidatedBackup, BackupEntryError> {
+        // 1. Direktori backup harus ada dan bukan symlink
+        let folder_meta = match fs::symlink_metadata(path) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackupEntryError::Invalid(format!(
+                    "Direktori backup {:?} tidak ditemukan",
+                    path
+                )));
+            }
+            Err(e) => return Err(BackupEntryError::Io(e)),
+        };
+
+        if folder_meta.file_type().is_symlink() {
+            return Err(BackupEntryError::Invalid(format!(
+                "Direktori backup {:?} adalah symbolic link, ditolak",
+                path
+            )));
+        }
+        if !folder_meta.file_type().is_dir() {
+            return Err(BackupEntryError::Invalid(format!(
+                "Path backup {:?} bukan sebuah direktori",
+                path
+            )));
+        }
+
         let manifest_file = path.join("manifest.json");
         let main_db = path.join("kasir_pos.db");
         let log_db = path.join("kasir_pos_log.db");
 
-        // 1. Manifest dapat dibaca
+        // 2. manifest.json harus file reguler bukan symlink
+        let manifest_meta = match fs::symlink_metadata(&manifest_file) {
+            Ok(m) => m,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackupEntryError::Invalid(format!(
+                    "File manifest.json tidak ditemukan di {:?}",
+                    manifest_file
+                )));
+            }
+            Err(e) => return Err(BackupEntryError::Io(e)),
+        };
+
+        if manifest_meta.file_type().is_symlink() {
+            return Err(BackupEntryError::Invalid(format!(
+                "File manifest {:?} adalah symbolic link, ditolak",
+                manifest_file
+            )));
+        }
+        if !manifest_meta.file_type().is_file() {
+            return Err(BackupEntryError::Invalid(format!(
+                "File manifest {:?} bukan file reguler",
+                manifest_file
+            )));
+        }
+
+        // Baca konten manifest
         let content = match fs::read_to_string(&manifest_file) {
             Ok(c) => c,
-            Err(e) => {
-                log::debug!("Retention skip {:?}: manifest tidak terbaca ({})", path, e);
-                return false;
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Err(BackupEntryError::Invalid(format!(
+                    "File manifest.json tidak ditemukan di {:?}",
+                    manifest_file
+                )));
             }
+            Err(e) => return Err(BackupEntryError::Io(e)),
         };
 
-        // 2. Manifest dapat di-parse
-        let manifest: BackupManifest = match serde_json::from_str(&content) {
-            Ok(m) => m,
-            Err(e) => {
-                log::debug!("Retention skip {:?}: manifest JSON korup ({})", path, e);
-                return false;
-            }
-        };
+        // 3. Manifest JSON parsing
+        let manifest: BackupManifest = serde_json::from_str(&content).map_err(|e| {
+            BackupEntryError::Invalid(format!("Manifest JSON korup di {:?}: {}", manifest_file, e))
+        })?;
 
-        // 3. backup_id manifest sesuai dengan nama folder
+        // 4. backup_id manifest sesuai dengan nama direktori
         if manifest.backup_id != folder_name {
-            log::debug!(
-                "Retention skip {:?}: backup_id manifest ('{}') tidak cocok dengan nama folder ('{}')",
-                path,
-                manifest.backup_id,
-                folder_name
-            );
-            return false;
+            return Err(BackupEntryError::Invalid(format!(
+                "backup_id manifest ('{}') tidak cocok dengan nama direktori ('{}')",
+                manifest.backup_id, folder_name
+            )));
         }
 
-        // 4 & 5. Kedua database tersedia dan lolos validasi SQLite (open & PRAGMA integrity_check)
-        let actual_main_size = match Self::validate_sqlite_database(&main_db) {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("Retention skip {:?}: main_db tidak valid ({})", path, e);
-                return false;
-            }
-        };
+        // 5. Validasi created_at (RFC 3339)
+        if manifest.created_at.trim().is_empty() {
+            return Err(BackupEntryError::Invalid(
+                "created_at manifest kosong".to_string(),
+            ));
+        }
+        let parsed_dt =
+            chrono::DateTime::parse_from_rfc3339(&manifest.created_at).map_err(|e| {
+                BackupEntryError::Invalid(format!(
+                    "Format created_at manifest invalid (bukan RFC 3339): {}",
+                    e
+                ))
+            })?;
+        let created_at_ts = parsed_dt.timestamp_millis();
 
-        let actual_log_size = match Self::validate_sqlite_database(&log_db) {
-            Ok(s) => s,
-            Err(e) => {
-                log::debug!("Retention skip {:?}: log_db tidak valid ({})", path, e);
-                return false;
-            }
-        };
+        // 6 & 7. Validasi kedua database (open, integrity_check, bukan symlink)
+        let actual_main_size = Self::validate_sqlite_database(&main_db)?;
+        let actual_log_size = Self::validate_sqlite_database(&log_db)?;
 
-        // 6. Ukuran aktual database sesuai dengan metadata manifest
-        if actual_main_size != manifest.main_db_size || actual_log_size != manifest.log_db_size {
-            log::debug!(
-                "Retention skip {:?}: ukuran file aktual (main={}, log={}) tidak cocok dengan manifest (main={}, log={})",
-                path,
-                actual_main_size,
-                actual_log_size,
-                manifest.main_db_size,
-                manifest.log_db_size
-            );
-            return false;
+        // 8. Ukuran aktual database sesuai dengan metadata manifest
+        if actual_main_size != manifest.main_db_size {
+            return Err(BackupEntryError::Invalid(format!(
+                "Ukuran kasir_pos.db aktual ({} bytes) tidak cocok dengan metadata manifest ({} bytes)",
+                actual_main_size, manifest.main_db_size
+            )));
+        }
+        if actual_log_size != manifest.log_db_size {
+            return Err(BackupEntryError::Invalid(format!(
+                "Ukuran kasir_pos_log.db aktual ({} bytes) tidak cocok dengan metadata manifest ({} bytes)",
+                actual_log_size, manifest.log_db_size
+            )));
         }
 
-        true
+        Ok(ValidatedBackup {
+            manifest,
+            created_at_ts,
+        })
     }
 
-    /// Menghapus backup lama yang melampaui batas retensi maksimum (default 10)
-    /// Hanya menghitung backup yang terverifikasi valid sesuai seluruh 6 kriteria
+    /// Helper kompatibilitas untuk memeriksa validitas backup
+    pub fn is_backup_entry_valid(path: &Path, folder_name: &str) -> bool {
+        Self::validate_backup_entry(path, folder_name).is_ok()
+    }
+
+    /// Menghapus backup lama yang melampaui batas retensi maksimum (default 10).
+    /// Hanya menghitung backup yang terverifikasi valid sesuai seluruh kriteria integritas data.
+    /// Pengurutan dilakukan berdasarkan timestamp pembuatan aktual (created_at).
+    /// Backup invalid diabaikan dengan warning log, sedangkan error filesystem dilaporkan eksplisit.
     pub fn enforce_retention_policy(
         backups_dir: &Path,
         max_keep: usize,
     ) -> std::result::Result<Vec<String>, String> {
-        let mut valid_dirs = Vec::new();
+        Self::enforce_retention_policy_internal(
+            backups_dir,
+            max_keep,
+            Self::validate_backup_entry,
+            |p| fs::remove_dir_all(p),
+        )
+    }
 
-        if let Ok(entries) = fs::read_dir(backups_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        // Hanya proses direktori backup_ dan hanya yang benar-benar valid
-                        if name.starts_with("backup_") && Self::is_backup_entry_valid(&path, name) {
-                            valid_dirs.push((name.to_string(), path));
-                        }
-                    }
+    pub(crate) fn enforce_retention_policy_internal<V, D>(
+        backups_dir: &Path,
+        max_keep: usize,
+        validator: V,
+        deleter: D,
+    ) -> std::result::Result<Vec<String>, String>
+    where
+        V: Fn(&Path, &str) -> Result<ValidatedBackup, BackupEntryError>,
+        D: Fn(&Path) -> std::io::Result<()>,
+    {
+        match fs::symlink_metadata(backups_dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "Direktori backup {:?} adalah symbolic link, ditolak",
+                        backups_dir
+                    ));
+                }
+                if !meta.is_dir() {
+                    return Err(format!(
+                        "Path backup {:?} bukan sebuah direktori",
+                        backups_dir
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Gagal memeriksa direktori backup {:?}: {}",
+                    backups_dir, e
+                ));
+            }
+        }
+
+        let entries = fs::read_dir(backups_dir)
+            .map_err(|e| format!("Gagal membaca direktori backup {:?}: {}", backups_dir, e))?;
+
+        let mut valid_dirs: Vec<(i64, String, PathBuf)> = Vec::new();
+
+        for entry_res in entries {
+            let entry = entry_res
+                .map_err(|e| format!("Gagal membaca entri di {:?}: {}", backups_dir, e))?;
+            let path = entry.path();
+
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => return Err(format!("Gagal membaca file type entri {:?}: {}", path, e)),
+            };
+
+            if file_type.is_symlink() {
+                log::warn!(
+                    "Retention mengabaikan backup invalid (symbolic link): {:?}",
+                    path
+                );
+                continue;
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
+
+            let name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(n) => n,
+                None => continue,
+            };
+
+            // Abaikan folder non-backup (seperti folder staging .staging_...)
+            if !name.starts_with("backup_") {
+                continue;
+            }
+
+            match validator(&path, name) {
+                Ok(validated) => {
+                    valid_dirs.push((validated.created_at_ts, name.to_string(), path));
+                }
+                Err(BackupEntryError::Invalid(reason)) => {
+                    log::warn!(
+                        "Retention mengabaikan backup invalid {:?}: {}",
+                        path,
+                        reason
+                    );
+                }
+                Err(BackupEntryError::Io(e)) => {
+                    return Err(format!(
+                        "Filesystem error saat memeriksa backup {:?}: {}",
+                        path, e
+                    ));
                 }
             }
         }
 
-        // Urutkan nama folder descending (format backup_YYYYMMDD_HHMMSS_<nanos> terurut waktu)
-        valid_dirs.sort_by(|a, b| b.0.cmp(&a.0));
+        // Urutkan kandidat retensi berdasarkan timestamp pembuatan (created_at) descending (terbaru dahulu)
+        valid_dirs.sort_by(|a, b| b.0.cmp(&a.0).then_with(|| b.1.cmp(&a.1)));
 
         let mut deleted = Vec::new();
         if valid_dirs.len() > max_keep {
-            for (name, path) in valid_dirs.iter().skip(max_keep) {
-                if let Err(e) = fs::remove_dir_all(path) {
-                    log::warn!("Gagal menghapus backup kadaluarsa {}: {}", name, e);
-                } else {
-                    deleted.push(name.clone());
-                }
+            for (_ts, name, path) in valid_dirs.iter().skip(max_keep) {
+                deleter(path)
+                    .map_err(|e| format!("Gagal menghapus backup kadaluarsa {:?}: {}", path, e))?;
+                deleted.push(name.clone());
             }
         }
 
         Ok(deleted)
     }
 
-    /// Mengambil daftar seluruh backup lokal dari direktori tertentu
+    /// Mengambil daftar seluruh backup lokal dari direktori tertentu.
+    /// Hanya mengembalikan backup yang terverifikasi valid dan siap direstore.
+    /// Pengurutan dilakukan berdasarkan timestamp pembuatan aktual (created_at) descending.
     pub fn list_backups_in(backups_dir: &Path) -> Result<Vec<BackupItem>, String> {
+        Self::list_backups_in_internal(backups_dir, Self::validate_backup_entry)
+    }
+
+    pub(crate) fn list_backups_in_internal<V>(
+        backups_dir: &Path,
+        validator: V,
+    ) -> Result<Vec<BackupItem>, String>
+    where
+        V: Fn(&Path, &str) -> Result<ValidatedBackup, BackupEntryError>,
+    {
+        match fs::symlink_metadata(backups_dir) {
+            Ok(meta) => {
+                if meta.file_type().is_symlink() {
+                    return Err(format!(
+                        "Direktori backup {:?} adalah symbolic link, ditolak",
+                        backups_dir
+                    ));
+                }
+                if !meta.is_dir() {
+                    return Err(format!(
+                        "Path backup {:?} bukan sebuah direktori",
+                        backups_dir
+                    ));
+                }
+            }
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                return Ok(Vec::new());
+            }
+            Err(e) => {
+                return Err(format!(
+                    "Gagal memeriksa direktori backup {:?}: {}",
+                    backups_dir, e
+                ));
+            }
+        }
+
+        let entries = fs::read_dir(backups_dir)
+            .map_err(|e| format!("Gagal membaca direktori backup {:?}: {}", backups_dir, e))?;
+
         let mut items = Vec::new();
 
-        if let Ok(entries) = fs::read_dir(backups_dir) {
-            for entry in entries.flatten() {
-                let path = entry.path();
-                if path.is_dir() {
-                    let folder_name = path
-                        .file_name()
-                        .and_then(|n| n.to_str())
-                        .unwrap_or_default()
-                        .to_string();
+        for entry_res in entries {
+            let entry = entry_res.map_err(|e| {
+                format!("Gagal membaca entri direktori di {:?}: {}", backups_dir, e)
+            })?;
+            let path = entry.path();
 
-                    if !folder_name.starts_with("backup_") {
-                        continue;
-                    }
+            let file_type = match entry.file_type() {
+                Ok(ft) => ft,
+                Err(e) => return Err(format!("Gagal membaca file type entri {:?}: {}", path, e)),
+            };
 
-                    let manifest_file = path.join("manifest.json");
-                    let (created_at, total_bytes) = if manifest_file.exists() {
-                        if let Ok(content) = fs::read_to_string(&manifest_file) {
-                            if let Ok(m) = serde_json::from_str::<BackupManifest>(&content) {
-                                (m.created_at, m.main_db_size + m.log_db_size)
-                            } else {
-                                ("-".to_string(), 0)
-                            }
-                        } else {
-                            ("-".to_string(), 0)
-                        }
-                    } else {
-                        ("-".to_string(), 0)
-                    };
+            if file_type.is_symlink() {
+                log::warn!(
+                    "Listing mengabaikan backup invalid (symbolic link): {:?}",
+                    path
+                );
+                continue;
+            }
+            if !file_type.is_dir() {
+                continue;
+            }
 
-                    items.push(BackupItem {
-                        backup_id: folder_name.clone(),
-                        folder_name,
-                        path: path.to_string_lossy().to_string(),
-                        total_size_bytes: total_bytes,
-                        total_size_formatted: Self::format_bytes(total_bytes),
-                        created_at,
-                        cloud_synced: false,
-                    });
+            let folder_name = match path.file_name().and_then(|n| n.to_str()) {
+                Some(name) => name.to_string(),
+                None => continue,
+            };
+
+            // Abaikan folder non-backup (seperti .staging_...)
+            if !folder_name.starts_with("backup_") {
+                continue;
+            }
+
+            // Hanya sertakan jika benar-benar valid
+            match validator(&path, &folder_name) {
+                Ok(validated) => {
+                    let manifest = validated.manifest;
+                    let total_bytes = manifest.main_db_size + manifest.log_db_size;
+                    items.push((
+                        validated.created_at_ts,
+                        BackupItem {
+                            backup_id: manifest.backup_id,
+                            folder_name,
+                            path: path.to_string_lossy().to_string(),
+                            total_size_bytes: total_bytes,
+                            total_size_formatted: Self::format_bytes(total_bytes),
+                            created_at: manifest.created_at,
+                            cloud_synced: false,
+                        },
+                    ));
+                }
+                Err(BackupEntryError::Invalid(reason)) => {
+                    log::warn!("Listing mengabaikan backup invalid {:?}: {}", path, reason);
+                }
+                Err(BackupEntryError::Io(e)) => {
+                    return Err(format!(
+                        "Filesystem error saat memeriksa backup {:?}: {}",
+                        path, e
+                    ));
                 }
             }
         }
 
-        items.sort_by(|a, b| b.backup_id.cmp(&a.backup_id));
-        Ok(items)
+        items.sort_by(|a, b| {
+            b.0.cmp(&a.0)
+                .then_with(|| b.1.backup_id.cmp(&a.1.backup_id))
+        });
+
+        Ok(items.into_iter().map(|(_, item)| item).collect())
     }
 
     /// Mengambil daftar seluruh backup lokal dari direktori default aplikasi
@@ -802,7 +1164,260 @@ mod tests {
     }
 
     #[test]
-    fn test_retention_only_keeps_10_latest_valid_backups() {
+    fn test_listing_displays_valid_backups() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_listing_valid_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+
+        // Buat 2 backup valid dengan waktu berbeda
+        for i in 1..=2 {
+            let bkp_name = format!("backup_20261101_{:02}0000_000000000", i);
+            let bkp_dir = backups_dir.join(&bkp_name);
+            fs::create_dir_all(&bkp_dir).unwrap();
+
+            let main_db = bkp_dir.join("kasir_pos.db");
+            let log_db = bkp_dir.join("kasir_pos_log.db");
+            let main_size = create_test_sqlite_file(&main_db, "main_tbl");
+            let log_size = create_test_sqlite_file(&log_db, "log_tbl");
+
+            let manifest = BackupManifest {
+                backup_id: bkp_name.clone(),
+                created_at: format!("2026-11-01T{:02}:00:00Z", i),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                main_db_size: main_size,
+                log_db_size: log_size,
+            };
+            fs::write(
+                bkp_dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+
+        let list = BackupService::list_backups_in(&backups_dir).expect("Listing must succeed");
+        assert_eq!(list.len(), 2);
+        // Terurut descending berdasarkan timestamp (i=2 lebih baru daripada i=1)
+        assert_eq!(list[0].backup_id, "backup_20261101_020000_000000000");
+        assert_eq!(list[1].backup_id, "backup_20261101_010000_000000000");
+        assert!(list[0].total_size_bytes > 0);
+        assert!(!list[0].total_size_formatted.is_empty());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_listing_rejects_invalid_manifest() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_listing_inv_man_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        let bkp_dir = backups_dir.join("backup_20261101_010000_000000000");
+        fs::create_dir_all(&bkp_dir).unwrap();
+
+        let main_db = bkp_dir.join("kasir_pos.db");
+        let log_db = bkp_dir.join("kasir_pos_log.db");
+        create_test_sqlite_file(&main_db, "m");
+        create_test_sqlite_file(&log_db, "l");
+        fs::write(bkp_dir.join("manifest.json"), b"{ invalid json").unwrap();
+
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Backup dengan manifest corrupt tidak boleh muncul di listing"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_listing_rejects_missing_manifest() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_listing_no_man_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        let bkp_dir = backups_dir.join("backup_20261101_010000_000000000");
+        fs::create_dir_all(&bkp_dir).unwrap();
+
+        let main_db = bkp_dir.join("kasir_pos.db");
+        let log_db = bkp_dir.join("kasir_pos_log.db");
+        create_test_sqlite_file(&main_db, "m");
+        create_test_sqlite_file(&log_db, "l");
+        // Tanpa manifest.json sama sekali
+
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Backup tanpa manifest tidak boleh muncul di listing"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_listing_rejects_corrupted_main_database() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_listing_corrupt_main_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        let bkp_name = "backup_20261101_010000_000000000";
+        let bkp_dir = backups_dir.join(bkp_name);
+        fs::create_dir_all(&bkp_dir).unwrap();
+
+        let main_db = bkp_dir.join("kasir_pos.db");
+        let log_db = bkp_dir.join("kasir_pos_log.db");
+        fs::write(&main_db, b"CORRUPTED_NON_SQLITE_BYTES").unwrap();
+        let log_size = create_test_sqlite_file(&log_db, "l");
+
+        let manifest = BackupManifest {
+            backup_id: bkp_name.to_string(),
+            created_at: "2026-11-01T01:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: 26,
+            log_db_size: log_size,
+        };
+        fs::write(
+            bkp_dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Backup dengan main db corrupt tidak boleh muncul di listing"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_listing_rejects_corrupted_log_database() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_listing_corrupt_log_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        let bkp_name = "backup_20261101_010000_000000000";
+        let bkp_dir = backups_dir.join(bkp_name);
+        fs::create_dir_all(&bkp_dir).unwrap();
+
+        let main_db = bkp_dir.join("kasir_pos.db");
+        let log_db = bkp_dir.join("kasir_pos_log.db");
+        let main_size = create_test_sqlite_file(&main_db, "m");
+        fs::write(&log_db, b"CORRUPTED_NON_SQLITE_BYTES").unwrap();
+
+        let manifest = BackupManifest {
+            backup_id: bkp_name.to_string(),
+            created_at: "2026-11-01T01:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: main_size,
+            log_db_size: 26,
+        };
+        fs::write(
+            bkp_dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Backup dengan log db corrupt tidak boleh muncul di listing"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_listing_rejects_missing_log_database() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_listing_no_log_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        let bkp_name = "backup_20261101_010000_000000000";
+        let bkp_dir = backups_dir.join(bkp_name);
+        fs::create_dir_all(&bkp_dir).unwrap();
+
+        let main_db = bkp_dir.join("kasir_pos.db");
+        let main_size = create_test_sqlite_file(&main_db, "m");
+        // kasir_pos_log.db sengaja tidak dibuat
+
+        let manifest = BackupManifest {
+            backup_id: bkp_name.to_string(),
+            created_at: "2026-11-01T01:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: main_size,
+            log_db_size: 4096,
+        };
+        fs::write(
+            bkp_dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Backup tanpa log db tidak boleh muncul di listing"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_listing_rejects_size_mismatch() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_listing_mismatch_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        let bkp_name = "backup_20261101_010000_000000000";
+        let bkp_dir = backups_dir.join(bkp_name);
+        fs::create_dir_all(&bkp_dir).unwrap();
+
+        let main_db = bkp_dir.join("kasir_pos.db");
+        let log_db = bkp_dir.join("kasir_pos_log.db");
+        let main_size = create_test_sqlite_file(&main_db, "m");
+        let log_size = create_test_sqlite_file(&log_db, "l");
+
+        let manifest = BackupManifest {
+            backup_id: bkp_name.to_string(),
+            created_at: "2026-11-01T01:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: main_size + 99999, // mismatch
+            log_db_size: log_size,
+        };
+        fs::write(
+            bkp_dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Backup dengan size mismatch tidak boleh muncul di listing"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_retention_retains_maximum_10_latest_valid_backups() {
         let (test_root, backups_dir, _manager, _conn_arc) = setup_isolated_test_env();
 
         // 1. Buat 12 backup valid menggunakan database SQLite sungguhan
@@ -830,82 +1445,10 @@ mod tests {
             .unwrap();
         }
 
-        // 2. Siapkan 4 skenario backup rusak:
-        // Skenario A: Manifest tidak valid (JSON rusak/unparseable)
-        let corrupt_manifest_dir = backups_dir.join("backup_20261101_130000_000000000");
-        fs::create_dir_all(&corrupt_manifest_dir).unwrap();
-        let main_a = corrupt_manifest_dir.join("kasir_pos.db");
-        let log_a = corrupt_manifest_dir.join("kasir_pos_log.db");
-        create_test_sqlite_file(&main_a, "main_a");
-        create_test_sqlite_file(&log_a, "log_a");
-        fs::write(
-            corrupt_manifest_dir.join("manifest.json"),
-            b"{ not a valid json content",
-        )
-        .unwrap();
-
-        // Skenario B: Database SQLite rusak (byte korup non-SQLite)
-        let corrupt_db_dir = backups_dir.join("backup_20261101_140000_000000000");
-        fs::create_dir_all(&corrupt_db_dir).unwrap();
-        let main_b = corrupt_db_dir.join("kasir_pos.db");
-        let log_b = corrupt_db_dir.join("kasir_pos_log.db");
-        fs::write(&main_b, b"CORRUPTED_NON_SQLITE_FILE_CONTENT").unwrap();
-        let log_b_size = create_test_sqlite_file(&log_b, "log_b");
-        let manifest_b = BackupManifest {
-            backup_id: "backup_20261101_140000_000000000".to_string(),
-            created_at: "2026-11-01T14:00:00Z".to_string(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
-            main_db_size: 34,
-            log_db_size: log_b_size,
-        };
-        fs::write(
-            corrupt_db_dir.join("manifest.json"),
-            serde_json::to_string(&manifest_b).unwrap(),
-        )
-        .unwrap();
-
-        // Skenario C: Tanpa file log database
-        let missing_log_dir = backups_dir.join("backup_20261101_150000_000000000");
-        fs::create_dir_all(&missing_log_dir).unwrap();
-        let main_c = missing_log_dir.join("kasir_pos.db");
-        let main_c_size = create_test_sqlite_file(&main_c, "main_c");
-        let manifest_c = BackupManifest {
-            backup_id: "backup_20261101_150000_000000000".to_string(),
-            created_at: "2026-11-01T15:00:00Z".to_string(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
-            main_db_size: main_c_size,
-            log_db_size: 4096,
-        };
-        fs::write(
-            missing_log_dir.join("manifest.json"),
-            serde_json::to_string(&manifest_c).unwrap(),
-        )
-        .unwrap();
-
-        // Skenario D: Ukuran database tidak sesuai metadata manifest
-        let size_mismatch_dir = backups_dir.join("backup_20261101_160000_000000000");
-        fs::create_dir_all(&size_mismatch_dir).unwrap();
-        let main_d = size_mismatch_dir.join("kasir_pos.db");
-        let log_d = size_mismatch_dir.join("kasir_pos_log.db");
-        let main_d_size = create_test_sqlite_file(&main_d, "main_d");
-        let log_d_size = create_test_sqlite_file(&log_d, "log_d");
-        let manifest_d = BackupManifest {
-            backup_id: "backup_20261101_160000_000000000".to_string(),
-            created_at: "2026-11-01T16:00:00Z".to_string(),
-            app_version: env!("CARGO_PKG_VERSION").to_string(),
-            main_db_size: main_d_size + 99999, // mismatch
-            log_db_size: log_d_size,
-        };
-        fs::write(
-            size_mismatch_dir.join("manifest.json"),
-            serde_json::to_string(&manifest_d).unwrap(),
-        )
-        .unwrap();
-
-        // 3. Jalankan retensi maksimal 10
+        // 2. Jalankan retensi maksimal 10
         let deleted = BackupService::enforce_retention_policy(&backups_dir, 10).unwrap();
 
-        // Dari 12 valid backup, tepat 2 tertua harus dihapus (i=1 dan i=2)
+        // Dari 12 valid backup, tepat 2 tertua berdasarkan created_at harus dihapus (i=1 dan i=2)
         assert_eq!(deleted.len(), 2);
         assert!(deleted.contains(&"backup_20261101_010000_000000000".to_string()));
         assert!(deleted.contains(&"backup_20261101_020000_000000000".to_string()));
@@ -921,25 +1464,511 @@ mod tests {
             );
         }
 
-        // Keempat backup rusak TIDAK BOLEH dihapus otomatis
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_invalid_backups_do_not_cause_valid_backups_to_be_deleted() {
+        let (test_root, backups_dir, _manager, _conn_arc) = setup_isolated_test_env();
+
+        // 1. Buat 10 backup valid
+        for i in 1..=10 {
+            let bkp_name = format!("backup_20261101_{:02}0000_000000000", i);
+            let bkp_dir = backups_dir.join(&bkp_name);
+            fs::create_dir_all(&bkp_dir).unwrap();
+
+            let main_db = bkp_dir.join("kasir_pos.db");
+            let log_db = bkp_dir.join("kasir_pos_log.db");
+            let main_size = create_test_sqlite_file(&main_db, "main_table");
+            let log_size = create_test_sqlite_file(&log_db, "log_table");
+
+            let manifest = BackupManifest {
+                backup_id: bkp_name.clone(),
+                created_at: format!("2026-11-01T{:02}:00:00Z", i),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                main_db_size: main_size,
+                log_db_size: log_size,
+            };
+            fs::write(
+                bkp_dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+
+        // 2. Tambahkan 4 folder backup invalid
+        let inv1 = backups_dir.join("backup_20261101_110000_inv_manifest");
+        fs::create_dir_all(&inv1).unwrap();
+        fs::write(inv1.join("manifest.json"), b"{ bad").unwrap();
+
+        let inv2 = backups_dir.join("backup_20261101_120000_inv_db");
+        fs::create_dir_all(&inv2).unwrap();
+        fs::write(inv2.join("kasir_pos.db"), b"bad db").unwrap();
+
+        let inv3 = backups_dir.join("backup_20261101_130000_no_manifest");
+        fs::create_dir_all(&inv3).unwrap();
+
+        let inv4 = backups_dir.join("backup_20261101_140000_mismatch");
+        fs::create_dir_all(&inv4).unwrap();
+        let m4 = create_test_sqlite_file(&inv4.join("kasir_pos.db"), "m4");
+        let l4 = create_test_sqlite_file(&inv4.join("kasir_pos_log.db"), "l4");
+        let man4 = BackupManifest {
+            backup_id: "backup_20261101_140000_mismatch".to_string(),
+            created_at: "2026-11-01T14:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m4 + 500,
+            log_db_size: l4,
+        };
+        fs::write(
+            inv4.join("manifest.json"),
+            serde_json::to_string(&man4).unwrap(),
+        )
+        .unwrap();
+
+        // 3. Jalankan retensi dengan limit 10
+        let deleted = BackupService::enforce_retention_policy(&backups_dir, 10).unwrap();
+
+        // Karena hanya ada 10 valid backup, TIDAK ADA valid backup yang dihapus
         assert!(
-            corrupt_manifest_dir.exists(),
-            "Skenario A tidak boleh terhapus"
-        );
-        assert!(corrupt_db_dir.exists(), "Skenario B tidak boleh terhapus");
-        assert!(missing_log_dir.exists(), "Skenario C tidak boleh terhapus");
-        assert!(
-            size_mismatch_dir.exists(),
-            "Skenario D tidak boleh terhapus"
+            deleted.is_empty(),
+            "Tidak boleh ada valid backup yang dihapus"
         );
 
-        // Total folder yang tersisa adalah 10 valid + 4 rusak = 14 direktori
-        let all_folders: Vec<_> = fs::read_dir(&backups_dir)
-            .unwrap()
-            .flatten()
-            .filter(|e| e.path().is_dir())
-            .collect();
-        assert_eq!(all_folders.len(), 14);
+        // Semua 10 backup valid tetap ada
+        for i in 1..=10 {
+            assert!(backups_dir
+                .join(format!("backup_20261101_{:02}0000_000000000", i))
+                .exists());
+        }
+
+        // Keempat backup invalid juga tidak boleh dihapus otomatis
+        assert!(inv1.exists());
+        assert!(inv2.exists());
+        assert!(inv3.exists());
+        assert!(inv4.exists());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_staging_backups_not_counted_as_final() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_staging_ignored_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+
+        // Buat folder staging tiruan yang sedang diproses
+        let staging_dir = backups_dir.join(".staging_backup_20261101_010000_000000000");
+        fs::create_dir_all(&staging_dir).unwrap();
+        let main_db = staging_dir.join("kasir_pos.db");
+        let log_db = staging_dir.join("kasir_pos_log.db");
+        let m_size = create_test_sqlite_file(&main_db, "m");
+        let l_size = create_test_sqlite_file(&log_db, "l");
+        let manifest = BackupManifest {
+            backup_id: "backup_20261101_010000_000000000".to_string(),
+            created_at: "2026-11-01T01:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m_size,
+            log_db_size: l_size,
+        };
+        fs::write(
+            staging_dir.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        // Listing tidak boleh memuat folder staging
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Folder staging tidak boleh masuk listing backup final"
+        );
+
+        // Retention tidak boleh menghapus atau memperhitungkan folder staging
+        let deleted = BackupService::enforce_retention_policy(&backups_dir, 10).unwrap();
+        assert!(deleted.is_empty());
+        assert!(
+            staging_dir.exists(),
+            "Folder staging tidak boleh dihapus oleh retensi"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_filesystem_read_dir_failure_handled_explicitly() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_fs_read_err_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        fs::create_dir_all(&test_root).unwrap();
+
+        // 1. Path berupa file reguler (bukan direktori)
+        let not_a_dir = test_root.join("regular_file.txt");
+        fs::write(&not_a_dir, b"not a directory").unwrap();
+
+        let list_res = BackupService::list_backups_in(&not_a_dir);
+        assert!(
+            list_res.is_err(),
+            "Kegagalan pemeriksaan direktori pada listing harus mengembalikan Err"
+        );
+        let list_err = list_res.unwrap_err();
+        assert!(list_err.contains("bukan sebuah direktori"));
+
+        let ret_res = BackupService::enforce_retention_policy(&not_a_dir, 10);
+        assert!(
+            ret_res.is_err(),
+            "Kegagalan pemeriksaan direktori pada retensi harus mengembalikan Err"
+        );
+        let ret_err = ret_res.unwrap_err();
+        assert!(ret_err.contains("bukan sebuah direktori"));
+
+        // 2. Simulated filesystem I/O error pada entri (BackupEntryError::Io) harus menghentikan listing & retensi
+        let backups_dir = test_root.join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+        let bkp_dir = backups_dir.join("backup_20261101_100000_000000000");
+        fs::create_dir_all(&bkp_dir).unwrap();
+
+        let io_failing_validator =
+            |_p: &Path, _n: &str| -> Result<ValidatedBackup, BackupEntryError> {
+                Err(BackupEntryError::Io(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "Simulated filesystem I/O fault",
+                )))
+            };
+
+        let list_io_res =
+            BackupService::list_backups_in_internal(&backups_dir, io_failing_validator);
+        assert!(
+            list_io_res.is_err(),
+            "Filesystem error harus menghentikan listing"
+        );
+        assert!(list_io_res
+            .unwrap_err()
+            .contains("Filesystem error saat memeriksa backup"));
+
+        let ret_io_res = BackupService::enforce_retention_policy_internal(
+            &backups_dir,
+            10,
+            io_failing_validator,
+            |p| fs::remove_dir_all(p),
+        );
+        assert!(
+            ret_io_res.is_err(),
+            "Filesystem error harus menghentikan retention"
+        );
+        assert!(ret_io_res
+            .unwrap_err()
+            .contains("Filesystem error saat memeriksa backup"));
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_non_existent_backups_dir_returns_empty_list() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_non_existent_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let non_existent = test_root.join("missing_dir");
+
+        let list = BackupService::list_backups_in(&non_existent).unwrap();
+        assert!(
+            list.is_empty(),
+            "Folder hilang harus menghasilkan list kosong"
+        );
+
+        let deleted = BackupService::enforce_retention_policy(&non_existent, 10).unwrap();
+        assert!(
+            deleted.is_empty(),
+            "Folder hilang tidak boleh menghapus apapun"
+        );
+    }
+
+    #[test]
+    fn test_validation_created_at_rfc3339() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_created_at_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+
+        // 1. Backup dengan created_at valid (RFC 3339)
+        let valid_name = "backup_20261101_100000_000000000";
+        let valid_dir = backups_dir.join(valid_name);
+        fs::create_dir_all(&valid_dir).unwrap();
+        let m_size = create_test_sqlite_file(&valid_dir.join("kasir_pos.db"), "m");
+        let l_size = create_test_sqlite_file(&valid_dir.join("kasir_pos_log.db"), "l");
+        let valid_manifest = BackupManifest {
+            backup_id: valid_name.to_string(),
+            created_at: "2026-11-01T10:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m_size,
+            log_db_size: l_size,
+        };
+        fs::write(
+            valid_dir.join("manifest.json"),
+            serde_json::to_string(&valid_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let val_res = BackupService::validate_backup_entry(&valid_dir, valid_name);
+        assert!(
+            val_res.is_ok(),
+            "Manifest dengan RFC 3339 valid harus diterima"
+        );
+        let validated = val_res.unwrap();
+        assert_eq!(validated.manifest.backup_id, valid_name);
+        assert!(validated.created_at_ts > 0);
+
+        // 2. Backup dengan created_at invalid (bukan RFC 3339)
+        let invalid_dt_name = "backup_20261101_110000_000000000";
+        let invalid_dt_dir = backups_dir.join(invalid_dt_name);
+        fs::create_dir_all(&invalid_dt_dir).unwrap();
+        create_test_sqlite_file(&invalid_dt_dir.join("kasir_pos.db"), "m");
+        create_test_sqlite_file(&invalid_dt_dir.join("kasir_pos_log.db"), "l");
+        let invalid_dt_manifest = BackupManifest {
+            backup_id: invalid_dt_name.to_string(),
+            created_at: "01-11-2026 10:00:00".to_string(), // format non-RFC 3339
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m_size,
+            log_db_size: l_size,
+        };
+        fs::write(
+            invalid_dt_dir.join("manifest.json"),
+            serde_json::to_string(&invalid_dt_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let val_err = BackupService::validate_backup_entry(&invalid_dt_dir, invalid_dt_name);
+        assert!(val_err.is_err(), "created_at non-RFC 3339 harus ditolak");
+        assert!(matches!(
+            val_err.unwrap_err(),
+            BackupEntryError::Invalid(msg) if msg.contains("RFC 3339")
+        ));
+
+        // 3. Backup dengan created_at kosong
+        let empty_dt_name = "backup_20261101_120000_000000000";
+        let empty_dt_dir = backups_dir.join(empty_dt_name);
+        fs::create_dir_all(&empty_dt_dir).unwrap();
+        create_test_sqlite_file(&empty_dt_dir.join("kasir_pos.db"), "m");
+        create_test_sqlite_file(&empty_dt_dir.join("kasir_pos_log.db"), "l");
+        let empty_dt_manifest = BackupManifest {
+            backup_id: empty_dt_name.to_string(),
+            created_at: "   ".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m_size,
+            log_db_size: l_size,
+        };
+        fs::write(
+            empty_dt_dir.join("manifest.json"),
+            serde_json::to_string(&empty_dt_manifest).unwrap(),
+        )
+        .unwrap();
+
+        let val_empty = BackupService::validate_backup_entry(&empty_dt_dir, empty_dt_name);
+        assert!(val_empty.is_err(), "created_at kosong harus ditolak");
+        assert!(matches!(
+            val_empty.unwrap_err(),
+            BackupEntryError::Invalid(msg) if msg.contains("kosong")
+        ));
+
+        // 4. Listing hanya mengembalikan backup dengan created_at valid
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert_eq!(list.len(), 1);
+        assert_eq!(list[0].backup_id, valid_name);
+
+        // 5. Retensi tidak menghapus backup valid akibat adanya backup dengan created_at invalid
+        let deleted = BackupService::enforce_retention_policy(&backups_dir, 10).unwrap();
+        assert!(deleted.is_empty());
+        assert!(valid_dir.exists(), "Backup valid harus tetap utuh");
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn test_backup_rejects_symlinks() {
+        use std::os::unix::fs as unix_fs;
+
+        let test_root = std::env::temp_dir().join(format!(
+            "test_symlinks_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+
+        // 1. Folder backup berupa symbolic link
+        let real_bkp = test_root.join("real_folder");
+        fs::create_dir_all(&real_bkp).unwrap();
+        let m_size = create_test_sqlite_file(&real_bkp.join("kasir_pos.db"), "m");
+        let l_size = create_test_sqlite_file(&real_bkp.join("kasir_pos_log.db"), "l");
+        let symlink_dir_name = "backup_20261101_100000_000000000";
+        let manifest = BackupManifest {
+            backup_id: symlink_dir_name.to_string(),
+            created_at: "2026-11-01T10:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m_size,
+            log_db_size: l_size,
+        };
+        fs::write(
+            real_bkp.join("manifest.json"),
+            serde_json::to_string(&manifest).unwrap(),
+        )
+        .unwrap();
+
+        let symlink_bkp = backups_dir.join(symlink_dir_name);
+        unix_fs::symlink(&real_bkp, &symlink_bkp).unwrap();
+
+        let val_symlink_dir = BackupService::validate_backup_entry(&symlink_bkp, symlink_dir_name);
+        assert!(
+            val_symlink_dir.is_err(),
+            "Folder backup symlink harus ditolak"
+        );
+        assert!(matches!(
+            val_symlink_dir.unwrap_err(),
+            BackupEntryError::Invalid(msg) if msg.contains("symbolic link")
+        ));
+
+        // 2. File manifest.json berupa symbolic link
+        let manifest_sym_name = "backup_20261101_110000_000000000";
+        let manifest_sym_dir = backups_dir.join(manifest_sym_name);
+        fs::create_dir_all(&manifest_sym_dir).unwrap();
+        create_test_sqlite_file(&manifest_sym_dir.join("kasir_pos.db"), "m");
+        create_test_sqlite_file(&manifest_sym_dir.join("kasir_pos_log.db"), "l");
+        let outside_manifest = test_root.join("outside_manifest.json");
+        let manifest2 = BackupManifest {
+            backup_id: manifest_sym_name.to_string(),
+            created_at: "2026-11-01T11:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m_size,
+            log_db_size: l_size,
+        };
+        fs::write(
+            &outside_manifest,
+            serde_json::to_string(&manifest2).unwrap(),
+        )
+        .unwrap();
+        unix_fs::symlink(&outside_manifest, manifest_sym_dir.join("manifest.json")).unwrap();
+
+        let val_sym_manifest =
+            BackupService::validate_backup_entry(&manifest_sym_dir, manifest_sym_name);
+        assert!(val_sym_manifest.is_err(), "Manifest symlink harus ditolak");
+        assert!(matches!(
+            val_sym_manifest.unwrap_err(),
+            BackupEntryError::Invalid(msg) if msg.contains("symbolic link")
+        ));
+
+        // 3. File database berupa symbolic link
+        let db_sym_name = "backup_20261101_120000_000000000";
+        let db_sym_dir = backups_dir.join(db_sym_name);
+        fs::create_dir_all(&db_sym_dir).unwrap();
+        let outside_db = test_root.join("outside.db");
+        create_test_sqlite_file(&outside_db, "o");
+        unix_fs::symlink(&outside_db, db_sym_dir.join("kasir_pos.db")).unwrap();
+        create_test_sqlite_file(&db_sym_dir.join("kasir_pos_log.db"), "l");
+        let manifest3 = BackupManifest {
+            backup_id: db_sym_name.to_string(),
+            created_at: "2026-11-01T12:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: m_size,
+            log_db_size: l_size,
+        };
+        fs::write(
+            db_sym_dir.join("manifest.json"),
+            serde_json::to_string(&manifest3).unwrap(),
+        )
+        .unwrap();
+
+        let val_sym_db = BackupService::validate_backup_entry(&db_sym_dir, db_sym_name);
+        assert!(val_sym_db.is_err(), "Database symlink harus ditolak");
+        assert!(matches!(
+            val_sym_db.unwrap_err(),
+            BackupEntryError::Invalid(msg) if msg.contains("symbolic link")
+        ));
+
+        // Listing harus kosong (semua symlink ditolak)
+        let list = BackupService::list_backups_in(&backups_dir).unwrap();
+        assert!(
+            list.is_empty(),
+            "Listing tidak boleh memuat backup dengan symlink"
+        );
+
+        // Retention tidak boleh menganggap backup symlink valid dan tidak menghapusnya
+        let deleted = BackupService::enforce_retention_policy(&backups_dir, 10).unwrap();
+        assert!(deleted.is_empty());
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
+    fn test_retention_reports_deletion_failure() {
+        let test_root = std::env::temp_dir().join(format!(
+            "test_del_fail_{}_{}",
+            chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0),
+            std::process::id()
+        ));
+        let backups_dir = test_root.join("backups");
+        fs::create_dir_all(&backups_dir).unwrap();
+
+        // Buat 11 backup valid
+        for i in 1..=11 {
+            let bkp_name = format!("backup_20261101_{:02}0000_000000000", i);
+            let bkp_dir = backups_dir.join(&bkp_name);
+            fs::create_dir_all(&bkp_dir).unwrap();
+
+            let main_db = bkp_dir.join("kasir_pos.db");
+            let log_db = bkp_dir.join("kasir_pos_log.db");
+            let main_size = create_test_sqlite_file(&main_db, "m");
+            let log_size = create_test_sqlite_file(&log_db, "l");
+
+            let manifest = BackupManifest {
+                backup_id: bkp_name.clone(),
+                created_at: format!("2026-11-01T{:02}:00:00Z", i),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                main_db_size: main_size,
+                log_db_size: log_size,
+            };
+            fs::write(
+                bkp_dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
+        }
+
+        // Simulasikan kegagalan deleter secara deterministik (tidak bergantung pada izin root/chmod)
+        let simulated_deleter = |_p: &Path| -> std::io::Result<()> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "Simulated OS disk write/unlink error",
+            ))
+        };
+
+        let ret_res = BackupService::enforce_retention_policy_internal(
+            &backups_dir,
+            10,
+            BackupService::validate_backup_entry,
+            simulated_deleter,
+        );
+
+        assert!(
+            ret_res.is_err(),
+            "Kegagalan menghapus backup kadaluarsa harus dikembalikan sebagai Err"
+        );
+        let err_msg = ret_res.unwrap_err();
+        assert!(
+            err_msg.contains("Gagal menghapus backup kadaluarsa"),
+            "Pesan error harus memuat kegagalan: {}",
+            err_msg
+        );
 
         let _ = fs::remove_dir_all(&test_root);
     }

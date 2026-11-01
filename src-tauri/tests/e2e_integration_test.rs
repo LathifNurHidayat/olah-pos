@@ -216,9 +216,10 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
     assert_eq!(dashboard.kas_masuk_hari_ini, 25000);
     assert_eq!(dashboard.kas_keluar_hari_ini, 150000);
 
-    // 10. Backup Snapshot & Retention
+    // 10. Backup Snapshot & Retention (Isolated temp directory)
     let temp_backup_dir = std::env::temp_dir().join(format!("olahpos_bkp_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
-    let _ = std::fs::create_dir_all(&temp_backup_dir);
+    let temp_backups_dest = temp_backup_dir.join("backups");
+    let _ = std::fs::create_dir_all(&temp_backups_dest);
     let dummy_main = temp_backup_dir.join("main.db");
     let dummy_log = temp_backup_dir.join("log.db");
     {
@@ -228,11 +229,11 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
         conn_log.execute("CREATE TABLE test_log (id INT);", []).unwrap();
     }
 
-    let backup_res = BackupService::create_backup_snapshot(&conn_arc, &dummy_main, &dummy_log)
+    let backup_res = BackupService::create_backup_snapshot_in(&conn_arc, &dummy_main, &dummy_log, &temp_backups_dest)
         .expect("Backup snapshot failed");
     assert!(backup_res.path.contains("backup_"));
 
-    let backups = BackupService::list_backups().expect("List backups failed");
+    let backups = BackupService::list_backups_in(&temp_backups_dest).expect("List backups failed");
     assert!(!backups.is_empty());
 
     let _ = std::fs::remove_dir_all(&temp_backup_dir);

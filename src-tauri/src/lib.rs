@@ -87,7 +87,11 @@ pub fn run() {
             commands::report::get_product_profit_report,
             commands::printer::generate_receipt_preview,
             commands::printer::generate_esc_pos_bytes,
-            commands::printer::print_receipt_thermal
+            commands::printer::print_receipt_thermal,
+            commands::backup::create_database_backup,
+            commands::backup::list_database_backups,
+            commands::backup::restore_database_backup,
+            commands::backup::setup_backup_scheduler
         ])
         .run(tauri::generate_context!())
         .expect("error while running olahpos application");

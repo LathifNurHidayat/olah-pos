@@ -7,6 +7,7 @@ import { InventoriPage } from "@/features/inventori/InventoriPage";
 import { PembelianPage } from "@/features/pembelian/PembelianPage";
 import { UtangPage } from "@/features/utang/UtangPage";
 import { LaporanPage } from "@/features/laporan/LaporanPage";
+import { BackupPage } from "@/features/backup/BackupPage";
 import { PengaturanPage } from "@/features/pengaturan/PengaturanPage";
 import { formatRupiah } from "@/lib/utils";
 import {
@@ -41,6 +42,7 @@ export function App() {
       {activeTab === "pembelian" && <PembelianPage />}
       {activeTab === "utang" && <UtangPage />}
       {activeTab === "laporan" && <LaporanPage />}
+      {activeTab === "backup" && <BackupPage currentUser={currentUser} />}
       {activeTab === "pengaturan" && <PengaturanPage currentUser={currentUser} />}
       {activeTab !== "dashboard" &&
         activeTab !== "kasir" &&
@@ -49,6 +51,7 @@ export function App() {
         activeTab !== "pembelian" &&
         activeTab !== "utang" &&
         activeTab !== "laporan" &&
+        activeTab !== "backup" &&
         activeTab !== "pengaturan" && (
           <GenericModulePlaceholder title={activeTab} />
         )}

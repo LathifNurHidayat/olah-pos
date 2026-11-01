@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backup;
 pub mod integration;
 pub mod inventory;
 pub mod master;

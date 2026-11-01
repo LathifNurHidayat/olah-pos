@@ -1,4 +1,5 @@
 pub mod auth;
+pub mod backup_service;
 pub mod crypto;
 pub mod integration_service;
 pub mod inventory_service;

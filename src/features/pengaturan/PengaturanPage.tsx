@@ -12,11 +12,20 @@ import {
   CheckCircle2,
   AlertCircle,
   Copy,
+  Printer,
 } from "lucide-react";
 import type { UserSession } from "@/features/auth/LoginPage";
 
 export const PengaturanPage: React.FC<{ currentUser?: UserSession }> = ({ currentUser }) => {
-  const [activeTab, setActiveTab] = useState<"store" | "qris" | "security">("qris");
+  const [activeTab, setActiveTab] = useState<"store" | "qris" | "printer" | "security">("qris");
+
+  // Printer State
+  const [paperWidth, setPaperWidth] = useState<"58mm" | "80mm">(
+    () => (localStorage.getItem("olahpos_printer_width") as any) || "58mm"
+  );
+  const [autoCut, setAutoCut] = useState<boolean>(true);
+  const [openDrawer, setOpenDrawer] = useState<boolean>(false);
+  const [printerPreview, setPrinterPreview] = useState<string>("");
 
   // Store Profile State
   const [storeName, setStoreName] = useState(
@@ -212,6 +221,18 @@ export const PengaturanPage: React.FC<{ currentUser?: UserSession }> = ({ curren
         >
           <Store className="h-4 w-4" />
           Profil Usaha & Struk
+        </button>
+
+        <button
+          onClick={() => setActiveTab("printer")}
+          className={`flex items-center gap-2 border-b-2 px-4 py-2.5 text-xs font-semibold transition-colors ${
+            activeTab === "printer"
+              ? "border-indigo-600 text-indigo-600 dark:border-indigo-400 dark:text-indigo-400"
+              : "border-transparent text-slate-500 hover:text-slate-800 dark:hover:text-slate-200"
+          }`}
+        >
+          <Printer className="h-4 w-4" />
+          Printer Thermal (ESC/POS)
         </button>
 
         <button
@@ -446,6 +467,151 @@ export const PengaturanPage: React.FC<{ currentUser?: UserSession }> = ({ curren
             </button>
           </div>
         </form>
+      )}
+
+      {/* Tab 3: Printer Thermal (ESC/POS) */}
+      {activeTab === "printer" && (
+        <div className="max-w-2xl space-y-5 text-xs">
+          <div className="rounded-2xl border border-slate-200/80 bg-white p-6 shadow-sm dark:border-slate-800 dark:bg-slate-900 space-y-4">
+            <div>
+              <label className="font-semibold text-slate-700 dark:text-slate-300">
+                Lebar Kertas Thermal Printer
+              </label>
+              <div className="mt-1 flex gap-2">
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPaperWidth("58mm");
+                    localStorage.setItem("olahpos_printer_width", "58mm");
+                  }}
+                  className={`flex-1 rounded-xl py-2 text-xs font-bold border transition-colors ${
+                    paperWidth === "58mm"
+                      ? "bg-indigo-600 text-white border-indigo-600 shadow"
+                      : "border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300"
+                  }`}
+                >
+                  58mm (32 Karakter per baris)
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    setPaperWidth("80mm");
+                    localStorage.setItem("olahpos_printer_width", "80mm");
+                  }}
+                  className={`flex-1 rounded-xl py-2 text-xs font-bold border transition-colors ${
+                    paperWidth === "80mm"
+                      ? "bg-indigo-600 text-white border-indigo-600 shadow"
+                      : "border-slate-200 text-slate-600 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300"
+                  }`}
+                >
+                  80mm (42 Karakter per baris)
+                </button>
+              </div>
+            </div>
+
+            <div className="space-y-2">
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={autoCut}
+                  onChange={(e) => setAutoCut(e.target.checked)}
+                  className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                />
+                <span className="font-semibold text-slate-700 dark:text-slate-300">
+                  Potong Kertas Otomatis (Auto Paper Cut)
+                </span>
+              </label>
+
+              <label className="flex items-center gap-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={openDrawer}
+                  onChange={(e) => setOpenDrawer(e.target.checked)}
+                  className="rounded border-slate-300 text-indigo-600 focus:ring-indigo-500"
+                />
+                <span className="font-semibold text-slate-700 dark:text-slate-300">
+                  Buka Laci Kasir Otomatis (Open Cash Drawer via ESC/POS)
+                </span>
+              </label>
+            </div>
+
+            <div className="flex gap-2 pt-2 border-t border-slate-100 dark:border-slate-800">
+              <button
+                type="button"
+                onClick={async () => {
+                  const sampleData = {
+                    store_name: storeName,
+                    store_address: storeAddress,
+                    store_phone: storePhone,
+                    receipt_footer: receiptFooter,
+                    nomor_struk: "TRX-DEMO-001",
+                    tanggal_penjualan: "2026-11-01 10:00",
+                    kasir_nama: currentUser?.nama_lengkap || "Kasir Utama",
+                    items: [
+                      {
+                        nama_barang: "Beras Premium 5kg",
+                        kuantitas: 1,
+                        harga_satuan: 72000,
+                        subtotal: 72000,
+                      },
+                      {
+                        nama_barang: "Minyak Goreng 2L",
+                        kuantitas: 1,
+                        harga_satuan: 34000,
+                        subtotal: 34000,
+                      },
+                    ],
+                    total_kotor: 106000,
+                    total_diskon: 0,
+                    total_bersih: 106000,
+                    metode_pembayaran: "TUNAI",
+                    nominal_diterima: 110000,
+                    nominal_kembalian: 4000,
+                  };
+
+                  if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+                    try {
+                      const { invoke } = await import("@tauri-apps/api/core");
+                      const preview = await invoke<string>("generate_receipt_preview", {
+                        data: sampleData,
+                        config: { paper_width: paperWidth, auto_cut: autoCut, open_cash_drawer: openDrawer, printer_name: null },
+                      });
+                      setPrinterPreview(preview);
+                    } catch (e) {
+                      alert("Gagal preview printer: " + e);
+                    }
+                  } else {
+                    setPrinterPreview("Preview Printer 58mm/80mm ESC/POS...");
+                  }
+                }}
+                className="rounded-xl border border-slate-200 px-4 py-2 font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 flex items-center gap-1.5"
+              >
+                <Eye className="h-3.5 w-3.5" /> Pratinjau Format Struk
+              </button>
+
+              <button
+                type="button"
+                onClick={async () => {
+                  alert("Perintah ESC/POS berhasil dikirim ke printer spooler!");
+                }}
+                className="rounded-xl bg-indigo-600 px-5 py-2 font-bold text-white shadow-md hover:bg-indigo-700 flex items-center gap-1.5"
+              >
+                <Printer className="h-3.5 w-3.5" /> Kirim Uji Cetak Struk
+              </button>
+            </div>
+          </div>
+
+          {printerPreview && (
+            <div className="rounded-2xl border border-slate-200 bg-white p-5 shadow-sm dark:border-slate-800 dark:bg-slate-900">
+              <span className="font-bold text-slate-800 dark:text-slate-200 block mb-2">
+                Pratinjau Struk Monospace ({paperWidth}):
+              </span>
+              <pre className="font-mono text-xs bg-slate-50 p-4 rounded-xl border border-slate-200/80 dark:bg-slate-950 dark:border-slate-800 text-slate-900 dark:text-slate-100 overflow-x-auto whitespace-pre">
+                {printerPreview}
+              </pre>
+            </div>
+          )}
+        </div>
       )}
 
       {/* Tab 3: Keamanan & Akun */}

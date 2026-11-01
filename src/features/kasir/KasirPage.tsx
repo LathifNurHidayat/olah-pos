@@ -379,6 +379,48 @@ export const KasirPage: React.FC<{ currentUser?: UserSession }> = ({ currentUser
     setSubmitting(false);
   };
 
+  const handlePrintReceipt = async () => {
+    if (!receiptData) return;
+    const storeName = localStorage.getItem("olahpos_store_name") || "Toko OlahPOS Sejahtera";
+    const storeAddress = localStorage.getItem("olahpos_store_address") || "Jl. Sudirman No. 45, Bandung";
+    const storePhone = localStorage.getItem("olahpos_store_phone") || "0812-3456-7890";
+    const receiptFooter = localStorage.getItem("olahpos_receipt_footer") || "Terima kasih atas kunjungan Anda!\nBarang yang sudah dibeli tidak dapat ditukar.";
+
+    const printData = {
+      store_name: storeName,
+      store_address: storeAddress,
+      store_phone: storePhone,
+      receipt_footer: receiptFooter,
+      nomor_struk: receiptData.nomor_struk,
+      tanggal_penjualan: receiptData.tanggal_penjualan,
+      kasir_nama: currentUser?.nama_lengkap || "Kasir",
+      items: receiptData.items.map((it) => ({
+        nama_barang: it.nama_barang,
+        kuantitas: it.kuantitas,
+        harga_satuan: it.harga_jual_satuan,
+        subtotal: it.subtotal,
+      })),
+      total_kotor: receiptData.total_kotor,
+      total_diskon: receiptData.total_diskon,
+      total_bersih: receiptData.total_bersih,
+      metode_pembayaran: receiptData.metode_pembayaran,
+      nominal_diterima: receiptData.nominal_diterima,
+      nominal_kembalian: receiptData.nominal_kembalian,
+    };
+
+    if (typeof window !== "undefined" && "__TAURI_INTERNALS__" in window) {
+      try {
+        const { invoke } = await import("@tauri-apps/api/core");
+        await invoke("print_receipt_thermal", { data: printData });
+        alert("Struk berhasil dikirim ke printer thermal!");
+      } catch (e) {
+        alert("Gagal cetak printer thermal: " + e);
+      }
+    } else {
+      alert("Simulasi cetak thermal ESC/POS 58mm/80mm berhasil!");
+    }
+  };
+
   const filteredProducts = products.filter((p) => {
     const matchQuery =
       p.nama_barang.toLowerCase().includes(searchQuery.toLowerCase()) ||
@@ -803,10 +845,10 @@ export const KasirPage: React.FC<{ currentUser?: UserSession }> = ({ currentUser
             <div className="flex gap-2 pt-4">
               <button
                 type="button"
-                onClick={() => alert("Mencetak ke printer thermal ESC/POS...")}
+                onClick={handlePrintReceipt}
                 className="flex-1 rounded-xl border border-slate-200 py-2.5 font-semibold text-slate-700 hover:bg-slate-50 dark:border-slate-700 dark:text-slate-300 flex items-center justify-center gap-1.5"
               >
-                <Printer className="h-4 w-4" /> Cetak
+                <Printer className="h-4 w-4" /> Cetak Struk
               </button>
               <button
                 type="button"

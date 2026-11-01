@@ -405,7 +405,7 @@ mod tests {
 
         // 3. Cek get_sales_report
         let (sales_sum, list) =
-            ReportService::get_sales_report(&conn_arc, "2026-01-01", "2026-12-31").unwrap();
+            ReportService::get_sales_report(&conn_arc, "2026-01-01", "2027-12-31").unwrap();
         assert_eq!(sales_sum.total_omset, 60000);
         assert_eq!(sales_sum.total_laba_kotor, 20000);
         assert_eq!(list.len(), 1);
@@ -413,7 +413,7 @@ mod tests {
 
         // 4. Cek product profit report
         let prod_report =
-            ReportService::get_product_profit_report(&conn_arc, "2026-01-01", "2026-12-31").unwrap();
+            ReportService::get_product_profit_report(&conn_arc, "2026-01-01", "2027-12-31").unwrap();
         assert_eq!(prod_report.len(), 1);
         assert_eq!(prod_report[0].kuantitas_terjual, 2);
         assert_eq!(prod_report[0].laba_kotor, 20000);

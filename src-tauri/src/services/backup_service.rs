@@ -93,8 +93,12 @@ impl BackupService {
         src_db_name: rusqlite::DatabaseName<'_>,
         dst_path: &Path,
     ) -> Result<(), String> {
-        let mut dst_conn = Connection::open(dst_path)
-            .map_err(|e| format!("Gagal menginisialisasi target database {:?}: {}", dst_path, e))?;
+        let mut dst_conn = Connection::open(dst_path).map_err(|e| {
+            format!(
+                "Gagal menginisialisasi target database {:?}: {}",
+                dst_path, e
+            )
+        })?;
 
         let backup = rusqlite::backup::Backup::new_with_names(
             src_conn,
@@ -102,7 +106,12 @@ impl BackupService {
             &mut dst_conn,
             rusqlite::DatabaseName::Main,
         )
-        .map_err(|e| format!("Gagal inisialisasi SQLite backup engine untuk {:?}: {}", dst_path, e))?;
+        .map_err(|e| {
+            format!(
+                "Gagal inisialisasi SQLite backup engine untuk {:?}: {}",
+                dst_path, e
+            )
+        })?;
 
         let mut busy_retries = 0;
         loop {
@@ -111,7 +120,8 @@ impl BackupService {
                 Ok(rusqlite::backup::StepResult::More) => {
                     std::thread::sleep(std::time::Duration::from_millis(2));
                 }
-                Ok(rusqlite::backup::StepResult::Busy) | Ok(rusqlite::backup::StepResult::Locked) => {
+                Ok(rusqlite::backup::StepResult::Busy)
+                | Ok(rusqlite::backup::StepResult::Locked) => {
                     busy_retries += 1;
                     if busy_retries > 10 {
                         return Err(format!(
@@ -169,11 +179,9 @@ impl BackupService {
     }
 
     /// Melakukan atomic online backup dual SQLite database (kasir_pos.db & kasir_pos_log.db)
-    /// ke direktori target yang ditentukan dengan staging dan validasi integritas
+    /// ke direktori target yang ditentukan dengan staging eksklusif dan validasi integritas
     pub fn create_backup_snapshot_in(
         db: &DbConnection,
-        _main_db_path: &Path,
-        _log_db_path: &Path,
         backups_dir: &Path,
     ) -> std::result::Result<BackupResult, String> {
         if !backups_dir.exists() {
@@ -181,23 +189,43 @@ impl BackupService {
                 .map_err(|e| format!("Gagal membuat direktori backups: {}", e))?;
         }
 
-        // 1. Generate collision-resistant ID (berbasis waktu dengan nanodetik & sequence counter fallback)
-        let now = chrono::Utc::now();
-        let base_id = format!("backup_{}", now.format("%Y%m%d_%H%M%S"));
-        let nano = now.timestamp_subsec_nanos();
-        let mut backup_id = format!("{}_{:09}", base_id, nano);
-        let mut counter = 1;
-        while backups_dir.join(&backup_id).exists()
-            || backups_dir.join(format!(".staging_{}", backup_id)).exists()
-        {
-            backup_id = format!("{}_{:09}_{}", base_id, nano, counter);
+        // 1. Generate ID & buat direktori staging secara eksklusif (anti-collision atomic)
+        let mut counter = 0;
+        let (backup_id, staging_dir) = loop {
+            let now = chrono::Utc::now();
+            let base_id = format!("backup_{}", now.format("%Y%m%d_%H%M%S"));
+            let nano = now.timestamp_subsec_nanos();
+            let candidate_id = if counter == 0 {
+                format!("{}_{:09}", base_id, nano)
+            } else {
+                format!("{}_{:09}_{}", base_id, nano, counter)
+            };
             counter += 1;
-        }
 
-        // 2. Buat direktori staging terisolasi
-        let staging_dir = backups_dir.join(format!(".staging_{}", backup_id));
-        fs::create_dir_all(&staging_dir)
-            .map_err(|e| format!("Gagal membuat folder staging backup: {}", e))?;
+            let target_dir = backups_dir.join(&candidate_id);
+            let candidate_staging = backups_dir.join(format!(".staging_{}", candidate_id));
+
+            // Jika folder backup final dengan nama ini sudah ada, cari ID berikutnya
+            if target_dir.exists() {
+                continue;
+            }
+
+            // fs::create_dir bersifat eksklusif pada level OS/filesystem (mkdir).
+            // Akan gagal dengan ErrorKind::AlreadyExists jika folder staging sudah dibuat oleh proses lain
+            match fs::create_dir(&candidate_staging) {
+                Ok(_) => break (candidate_id, candidate_staging),
+                Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => {
+                    // Collision terdeteksi, coba ID berikutnya tanpa berbagi staging milik proses lain
+                    continue;
+                }
+                Err(e) => {
+                    return Err(format!(
+                        "Gagal membuat folder staging backup eksklusif {:?}: {}",
+                        candidate_staging, e
+                    ));
+                }
+            }
+        };
 
         let mut staging_guard = StagingGuard {
             path: &staging_dir,
@@ -207,8 +235,9 @@ impl BackupService {
         let target_main_db = staging_dir.join("kasir_pos.db");
         let target_log_db = staging_dir.join("kasir_pos_log.db");
 
-        // 3. Kunci seluruh koneksi sumber selama proses snapshot dual-database
+        // 2. Kunci seluruh koneksi sumber selama proses snapshot dual-database
         // Ini menjamin tidak ada transaksi aplikasi yang menyela di antara backup kedua database
+        let now = chrono::Utc::now();
         {
             let src_conn = db
                 .lock()
@@ -217,7 +246,24 @@ impl BackupService {
             // Pastikan log_db benar-benar ter-attach pada koneksi sumber
             let log_attached = Self::is_database_attached(&src_conn, "log_db")?;
             if !log_attached {
-                return Err("Database log 'log_db' tidak ter-attach pada koneksi SQLite aktif!".to_string());
+                return Err(
+                    "Database log 'log_db' tidak ter-attach pada koneksi SQLite aktif!".to_string(),
+                );
+            }
+
+            // Catat metadata sumber database aktif untuk keterlacakan diagnostik
+            if let Ok(mut stmt) = src_conn.prepare("PRAGMA database_list;") {
+                if let Ok(rows) =
+                    stmt.query_map([], |r| Ok((r.get::<_, String>(1)?, r.get::<_, String>(2)?)))
+                {
+                    for row in rows.flatten() {
+                        log::info!(
+                            "SQLite database source attached: alias='{}', file='{}'",
+                            row.0,
+                            row.1
+                        );
+                    }
+                }
             }
 
             // Jalankan Online Backup untuk main DB (kasir_pos.db)
@@ -231,12 +277,12 @@ impl BackupService {
             )?;
         }
 
-        // 4. Validasi kedua database hasil backup secara mendalam (harus valid SQLite & integrity "ok")
+        // 3. Validasi kedua database hasil backup secara mendalam (harus valid SQLite & integrity "ok")
         let main_db_size = Self::validate_sqlite_database(&target_main_db)?;
         let log_db_size = Self::validate_sqlite_database(&target_log_db)?;
         let total_size = main_db_size + log_db_size;
 
-        // 5. Buat manifest.json dengan versi aplikasi riil dari Cargo.toml
+        // 4. Buat manifest.json dengan versi aplikasi riil dari Cargo.toml
         let manifest = BackupManifest {
             backup_id: backup_id.clone(),
             created_at: now.to_rfc3339(),
@@ -249,18 +295,20 @@ impl BackupService {
         fs::write(staging_dir.join("manifest.json"), manifest_json)
             .map_err(|e| format!("Gagal menulis manifest.json: {}", e))?;
 
-        // 6. Publikasikan folder backup secara atomik melalui rename
+        // 5. Publikasikan folder backup secara atomik melalui rename
         let target_dir = backups_dir.join(&backup_id);
         fs::rename(&staging_dir, &target_dir)
             .map_err(|e| format!("Gagal mempublikasikan folder backup secara atomik: {}", e))?;
 
         staging_guard.committed = true;
 
-        // 7. Jalankan kebijakan retensi hanya setelah backup terverifikasi sukses dipublikasikan
+        // 6. Jalankan kebijakan retensi hanya setelah backup terverifikasi sukses dipublikasikan
         let deleted_old_backups = Self::enforce_retention_policy(backups_dir, 10)?;
 
-        // 8. Cek status sinkronisasi cloud
-        let gdrive_config = IntegrationService::get_config(db, "GOOGLE_DRIVE_BACKUP").ok().flatten();
+        // 7. Cek status sinkronisasi cloud
+        let gdrive_config = IntegrationService::get_config(db, "GOOGLE_DRIVE_BACKUP")
+            .ok()
+            .flatten();
         let cloud_status = if gdrive_config.is_some() {
             "SYNCED_TO_GDRIVE".to_string()
         } else {
@@ -277,17 +325,87 @@ impl BackupService {
     }
 
     /// Melakukan backup snapshot menggunakan direktori default aplikasi (~/.local/share/olahpos/backups)
-    pub fn create_backup_snapshot(
-        db: &DbConnection,
-        main_db_path: &Path,
-        log_db_path: &Path,
-    ) -> std::result::Result<BackupResult, String> {
+    pub fn create_backup_snapshot(db: &DbConnection) -> std::result::Result<BackupResult, String> {
         let backups_dir = Self::get_backups_dir().map_err(|e| e.to_string())?;
-        Self::create_backup_snapshot_in(db, main_db_path, log_db_path, &backups_dir)
+        Self::create_backup_snapshot_in(db, &backups_dir)
+    }
+
+    /// Memvalidasi kelayakan entri backup untuk kebijakan retensi sesuai 6 kriteria:
+    /// 1. Manifest dapat dibaca
+    /// 2. Manifest dapat di-parse sebagai JSON valid
+    /// 3. backup_id manifest sesuai dengan nama folder
+    /// 4. Kedua file database (kasir_pos.db & kasir_pos_log.db) tersedia
+    /// 5. Kedua database lolos validate_sqlite_database()
+    /// 6. Ukuran aktual database sesuai dengan metadata manifest
+    pub fn is_backup_entry_valid(path: &Path, folder_name: &str) -> bool {
+        let manifest_file = path.join("manifest.json");
+        let main_db = path.join("kasir_pos.db");
+        let log_db = path.join("kasir_pos_log.db");
+
+        // 1. Manifest dapat dibaca
+        let content = match fs::read_to_string(&manifest_file) {
+            Ok(c) => c,
+            Err(e) => {
+                log::debug!("Retention skip {:?}: manifest tidak terbaca ({})", path, e);
+                return false;
+            }
+        };
+
+        // 2. Manifest dapat di-parse
+        let manifest: BackupManifest = match serde_json::from_str(&content) {
+            Ok(m) => m,
+            Err(e) => {
+                log::debug!("Retention skip {:?}: manifest JSON korup ({})", path, e);
+                return false;
+            }
+        };
+
+        // 3. backup_id manifest sesuai dengan nama folder
+        if manifest.backup_id != folder_name {
+            log::debug!(
+                "Retention skip {:?}: backup_id manifest ('{}') tidak cocok dengan nama folder ('{}')",
+                path,
+                manifest.backup_id,
+                folder_name
+            );
+            return false;
+        }
+
+        // 4 & 5. Kedua database tersedia dan lolos validasi SQLite (open & PRAGMA integrity_check)
+        let actual_main_size = match Self::validate_sqlite_database(&main_db) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("Retention skip {:?}: main_db tidak valid ({})", path, e);
+                return false;
+            }
+        };
+
+        let actual_log_size = match Self::validate_sqlite_database(&log_db) {
+            Ok(s) => s,
+            Err(e) => {
+                log::debug!("Retention skip {:?}: log_db tidak valid ({})", path, e);
+                return false;
+            }
+        };
+
+        // 6. Ukuran aktual database sesuai dengan metadata manifest
+        if actual_main_size != manifest.main_db_size || actual_log_size != manifest.log_db_size {
+            log::debug!(
+                "Retention skip {:?}: ukuran file aktual (main={}, log={}) tidak cocok dengan manifest (main={}, log={})",
+                path,
+                actual_main_size,
+                actual_log_size,
+                manifest.main_db_size,
+                manifest.log_db_size
+            );
+            return false;
+        }
+
+        true
     }
 
     /// Menghapus backup lama yang melampaui batas retensi maksimum (default 10)
-    /// Hanya menghitung backup yang terverifikasi valid
+    /// Hanya menghitung backup yang terverifikasi valid sesuai seluruh 6 kriteria
     pub fn enforce_retention_policy(
         backups_dir: &Path,
         max_keep: usize,
@@ -299,16 +417,9 @@ impl BackupService {
                 let path = entry.path();
                 if path.is_dir() {
                     if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
-                        // Hanya proses direktori backup_ (abaikan folder tersembunyi .staging_...)
-                        if name.starts_with("backup_") {
-                            let manifest_file = path.join("manifest.json");
-                            let main_db = path.join("kasir_pos.db");
-                            let log_db = path.join("kasir_pos_log.db");
-
-                            // Hanya anggap valid jika manifest dan kedua file database ada
-                            if manifest_file.exists() && main_db.exists() && log_db.exists() {
-                                valid_dirs.push((name.to_string(), path));
-                            }
+                        // Hanya proses direktori backup_ dan hanya yang benar-benar valid
+                        if name.starts_with("backup_") && Self::is_backup_entry_valid(&path, name) {
+                            valid_dirs.push((name.to_string(), path));
                         }
                     }
                 }
@@ -422,8 +533,11 @@ impl BackupService {
         let service_content = "[Unit]\nDescription=OlahPOS Daily Database Backup Service\n\n[Service]\nType=oneshot\nExecStart=/bin/sh -c 'echo \"OlahPOS scheduled backup executed\"'\n";
         let timer_content = "[Unit]\nDescription=OlahPOS Daily Database Backup Timer\n\n[Timer]\nOnCalendar=daily\nPersistent=true\n\n[Install]\nWantedBy=timers.target\n";
 
-        fs::write(systemd_user_dir.join("olahpos-backup.service"), service_content)
-            .map_err(|e| e.to_string())?;
+        fs::write(
+            systemd_user_dir.join("olahpos-backup.service"),
+            service_content,
+        )
+        .map_err(|e| e.to_string())?;
         fs::write(systemd_user_dir.join("olahpos-backup.timer"), timer_content)
             .map_err(|e| e.to_string())?;
 
@@ -470,19 +584,35 @@ mod tests {
         (test_root, backups_dir, manager, conn_arc)
     }
 
+    fn create_test_sqlite_file(path: &Path, table_name: &str) -> u64 {
+        let conn = Connection::open(path).expect("Failed to open test SQLite file");
+        conn.execute(
+            &format!(
+                "CREATE TABLE {} (id INTEGER PRIMARY KEY, note TEXT);",
+                table_name
+            ),
+            [],
+        )
+        .expect("Failed to create table");
+        conn.execute(
+            &format!(
+                "INSERT INTO {} (note) VALUES ('test_data_row');",
+                table_name
+            ),
+            [],
+        )
+        .expect("Failed to insert row");
+        conn.close().expect("Failed to close conn");
+        fs::metadata(path).expect("Failed to get metadata").len()
+    }
+
     #[test]
     fn test_backup_main_and_log_success_and_valid_sqlite() {
-        let (test_root, backups_dir, manager, conn_arc) = setup_isolated_test_env();
-        let paths = manager.get_paths();
+        let (test_root, backups_dir, _manager, conn_arc) = setup_isolated_test_env();
 
-        // 1. Eksekusi backup ke direktori terisolasi
-        let res = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &paths.main_db,
-            &paths.log_db,
-            &backups_dir,
-        )
-        .expect("Backup snapshot should succeed");
+        // 1. Eksekusi backup ke direktori terisolasi menggunakan API yang disederhanakan
+        let res = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir)
+            .expect("Backup snapshot should succeed");
 
         assert!(res.total_size_bytes > 0);
         let target_path = Path::new(&res.path);
@@ -537,14 +667,7 @@ mod tests {
         let conn = Connection::open_in_memory().unwrap();
         let conn_arc = Arc::new(Mutex::new(conn));
 
-        let dummy_path = test_root.join("dummy.db");
-
-        let result = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &dummy_path,
-            &dummy_path,
-            &backups_dir,
-        );
+        let result = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir);
 
         // Wajib gagal dan TIDAK membuat file dummy kosong
         assert!(result.is_err());
@@ -556,7 +679,10 @@ mod tests {
         assert!(list.is_empty());
 
         let entries: Vec<_> = fs::read_dir(&backups_dir).unwrap().flatten().collect();
-        assert!(entries.is_empty(), "Folder backups harus tetap bersih tanpa sisa staging");
+        assert!(
+            entries.is_empty(),
+            "Folder backups harus tetap bersih tanpa sisa staging"
+        );
 
         let _ = fs::remove_dir_all(&test_root);
     }
@@ -574,19 +700,16 @@ mod tests {
         // Koneksi tanpa log_db untuk memicu kegagalan saat proses berjalan
         let conn = Connection::open_in_memory().unwrap();
         let conn_arc = Arc::new(Mutex::new(conn));
-        let dummy = test_root.join("d.db");
 
-        let _ = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &dummy,
-            &dummy,
-            &backups_dir,
-        );
+        let _ = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir);
 
         // Pastikan tidak ada folder .staging_* yang tersisa
         for entry in fs::read_dir(&backups_dir).unwrap().flatten() {
             let name = entry.file_name().to_string_lossy().to_string();
-            assert!(!name.starts_with(".staging_"), "Staging directory harus dibersihkan otomatis");
+            assert!(
+                !name.starts_with(".staging_"),
+                "Staging directory harus dibersihkan otomatis"
+            );
         }
 
         let _ = fs::remove_dir_all(&test_root);
@@ -594,17 +717,11 @@ mod tests {
 
     #[test]
     fn test_previous_backups_remain_intact_when_new_backup_fails() {
-        let (test_root, backups_dir, manager, conn_arc) = setup_isolated_test_env();
-        let paths = manager.get_paths();
+        let (test_root, backups_dir, _manager, conn_arc) = setup_isolated_test_env();
 
         // 1. Buat backup pertama yang valid
-        let res1 = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &paths.main_db,
-            &paths.log_db,
-            &backups_dir,
-        )
-        .expect("First backup should succeed");
+        let res1 = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir)
+            .expect("First backup should succeed");
 
         let path1 = PathBuf::from(&res1.path);
         assert!(path1.exists());
@@ -613,13 +730,7 @@ mod tests {
 
         // 2. Coba buat backup kedua dengan koneksi yang rusak / tanpa log_db
         let broken_conn = Arc::new(Mutex::new(Connection::open_in_memory().unwrap()));
-        let dummy = test_root.join("dummy.db");
-        let res2 = BackupService::create_backup_snapshot_in(
-            &broken_conn,
-            &dummy,
-            &dummy,
-            &backups_dir,
-        );
+        let res2 = BackupService::create_backup_snapshot_in(&broken_conn, &backups_dir);
         assert!(res2.is_err());
 
         // 3. Pastikan backup pertama tetap utuh 100% dan tidak terganggu
@@ -636,33 +747,12 @@ mod tests {
 
     #[test]
     fn test_no_collision_when_backups_created_rapidly() {
-        let (test_root, backups_dir, manager, conn_arc) = setup_isolated_test_env();
-        let paths = manager.get_paths();
+        let (test_root, backups_dir, _manager, conn_arc) = setup_isolated_test_env();
 
         // Buat 3 backup secara cepat berturut-turut
-        let res1 = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &paths.main_db,
-            &paths.log_db,
-            &backups_dir,
-        )
-        .unwrap();
-
-        let res2 = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &paths.main_db,
-            &paths.log_db,
-            &backups_dir,
-        )
-        .unwrap();
-
-        let res3 = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &paths.main_db,
-            &paths.log_db,
-            &backups_dir,
-        )
-        .unwrap();
+        let res1 = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir).unwrap();
+        let res2 = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir).unwrap();
+        let res3 = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir).unwrap();
 
         // Pastikan ketiganya memiliki ID unik dan foldernya eksis
         assert_ne!(res1.backup_id, res2.backup_id);
@@ -680,49 +770,176 @@ mod tests {
     }
 
     #[test]
+    fn test_staging_directory_exclusive_collision_recovery() {
+        let (test_root, backups_dir, _manager, conn_arc) = setup_isolated_test_env();
+
+        // 1. Simulasikan tabrakan kandidat ID pertama dengan pre-creating folder staging milik proses lain
+        let now = chrono::Utc::now();
+        let base_id = format!("backup_{}", now.format("%Y%m%d_%H%M%S"));
+        let nano = now.timestamp_subsec_nanos();
+        let pre_existing_staging = backups_dir.join(format!(".staging_{}_{:09}", base_id, nano));
+        fs::create_dir(&pre_existing_staging).unwrap();
+        let sentinel_file = pre_existing_staging.join("sentinel.lock");
+        fs::write(&sentinel_file, b"foreign_process_in_progress").unwrap();
+
+        // 2. Jalankan backup OlahPOS
+        let res = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir)
+            .expect("Backup must gracefully recover from candidate collision");
+
+        // 3. Verifikasi backup berhasil dibuat dengan kandidat ID berbeda
+        assert!(Path::new(&res.path).exists());
+        assert_ne!(res.backup_id, format!("{}_{:09}", base_id, nano));
+
+        // 4. Verifikasi folder staging milik proses lain TIDAK disentuh atau ditimpa
+        assert!(pre_existing_staging.exists());
+        assert!(sentinel_file.exists());
+        assert_eq!(
+            fs::read(&sentinel_file).unwrap(),
+            b"foreign_process_in_progress"
+        );
+
+        let _ = fs::remove_dir_all(&test_root);
+    }
+
+    #[test]
     fn test_retention_only_keeps_10_latest_valid_backups() {
         let (test_root, backups_dir, _manager, _conn_arc) = setup_isolated_test_env();
 
-        // 1. Buat 12 mock valid backup direktori langsung di direktori terisolasi
+        // 1. Buat 12 backup valid menggunakan database SQLite sungguhan
         for i in 1..=12 {
             let bkp_name = format!("backup_20261101_{:02}0000_000000000", i);
             let bkp_dir = backups_dir.join(&bkp_name);
             fs::create_dir_all(&bkp_dir).unwrap();
 
-            // Tulis file tiruan yang lengkap
-            fs::write(bkp_dir.join("kasir_pos.db"), b"dummy content").unwrap();
-            fs::write(bkp_dir.join("kasir_pos_log.db"), b"dummy content").unwrap();
+            let main_db = bkp_dir.join("kasir_pos.db");
+            let log_db = bkp_dir.join("kasir_pos_log.db");
+            let main_size = create_test_sqlite_file(&main_db, "main_table");
+            let log_size = create_test_sqlite_file(&log_db, "log_table");
+
             let manifest = BackupManifest {
                 backup_id: bkp_name.clone(),
-                created_at: chrono::Utc::now().to_rfc3339(),
+                created_at: format!("2026-11-01T{:02}:00:00Z", i),
                 app_version: env!("CARGO_PKG_VERSION").to_string(),
-                main_db_size: 13,
-                log_db_size: 13,
+                main_db_size: main_size,
+                log_db_size: log_size,
             };
-            fs::write(bkp_dir.join("manifest.json"), serde_json::to_string(&manifest).unwrap()).unwrap();
+            fs::write(
+                bkp_dir.join("manifest.json"),
+                serde_json::to_string(&manifest).unwrap(),
+            )
+            .unwrap();
         }
 
-        // 2. Tambahkan 1 folder corrupt/parsial tanpa manifest
-        let corrupt_dir = backups_dir.join("backup_20261101_990000_000000000");
-        fs::create_dir_all(&corrupt_dir).unwrap();
-        fs::write(corrupt_dir.join("kasir_pos.db"), b"orphan").unwrap();
+        // 2. Siapkan 4 skenario backup rusak:
+        // Skenario A: Manifest tidak valid (JSON rusak/unparseable)
+        let corrupt_manifest_dir = backups_dir.join("backup_20261101_130000_000000000");
+        fs::create_dir_all(&corrupt_manifest_dir).unwrap();
+        let main_a = corrupt_manifest_dir.join("kasir_pos.db");
+        let log_a = corrupt_manifest_dir.join("kasir_pos_log.db");
+        create_test_sqlite_file(&main_a, "main_a");
+        create_test_sqlite_file(&log_a, "log_a");
+        fs::write(
+            corrupt_manifest_dir.join("manifest.json"),
+            b"{ not a valid json content",
+        )
+        .unwrap();
+
+        // Skenario B: Database SQLite rusak (byte korup non-SQLite)
+        let corrupt_db_dir = backups_dir.join("backup_20261101_140000_000000000");
+        fs::create_dir_all(&corrupt_db_dir).unwrap();
+        let main_b = corrupt_db_dir.join("kasir_pos.db");
+        let log_b = corrupt_db_dir.join("kasir_pos_log.db");
+        fs::write(&main_b, b"CORRUPTED_NON_SQLITE_FILE_CONTENT").unwrap();
+        let log_b_size = create_test_sqlite_file(&log_b, "log_b");
+        let manifest_b = BackupManifest {
+            backup_id: "backup_20261101_140000_000000000".to_string(),
+            created_at: "2026-11-01T14:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: 34,
+            log_db_size: log_b_size,
+        };
+        fs::write(
+            corrupt_db_dir.join("manifest.json"),
+            serde_json::to_string(&manifest_b).unwrap(),
+        )
+        .unwrap();
+
+        // Skenario C: Tanpa file log database
+        let missing_log_dir = backups_dir.join("backup_20261101_150000_000000000");
+        fs::create_dir_all(&missing_log_dir).unwrap();
+        let main_c = missing_log_dir.join("kasir_pos.db");
+        let main_c_size = create_test_sqlite_file(&main_c, "main_c");
+        let manifest_c = BackupManifest {
+            backup_id: "backup_20261101_150000_000000000".to_string(),
+            created_at: "2026-11-01T15:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: main_c_size,
+            log_db_size: 4096,
+        };
+        fs::write(
+            missing_log_dir.join("manifest.json"),
+            serde_json::to_string(&manifest_c).unwrap(),
+        )
+        .unwrap();
+
+        // Skenario D: Ukuran database tidak sesuai metadata manifest
+        let size_mismatch_dir = backups_dir.join("backup_20261101_160000_000000000");
+        fs::create_dir_all(&size_mismatch_dir).unwrap();
+        let main_d = size_mismatch_dir.join("kasir_pos.db");
+        let log_d = size_mismatch_dir.join("kasir_pos_log.db");
+        let main_d_size = create_test_sqlite_file(&main_d, "main_d");
+        let log_d_size = create_test_sqlite_file(&log_d, "log_d");
+        let manifest_d = BackupManifest {
+            backup_id: "backup_20261101_160000_000000000".to_string(),
+            created_at: "2026-11-01T16:00:00Z".to_string(),
+            app_version: env!("CARGO_PKG_VERSION").to_string(),
+            main_db_size: main_d_size + 99999, // mismatch
+            log_db_size: log_d_size,
+        };
+        fs::write(
+            size_mismatch_dir.join("manifest.json"),
+            serde_json::to_string(&manifest_d).unwrap(),
+        )
+        .unwrap();
 
         // 3. Jalankan retensi maksimal 10
         let deleted = BackupService::enforce_retention_policy(&backups_dir, 10).unwrap();
 
-        // Dari 12 valid backup, 2 tertua harus dihapus (i=1 dan i=2)
+        // Dari 12 valid backup, tepat 2 tertua harus dihapus (i=1 dan i=2)
         assert_eq!(deleted.len(), 2);
         assert!(deleted.contains(&"backup_20261101_010000_000000000".to_string()));
         assert!(deleted.contains(&"backup_20261101_020000_000000000".to_string()));
 
-        // Sisa 10 backup valid terbaru tetap ada, dan folder corrupt tidak tersentuh
-        let remaining = BackupService::list_backups_in(&backups_dir).unwrap();
-        assert_eq!(remaining.len(), 11);
-        let valid_remaining: Vec<_> = remaining
-            .into_iter()
-            .filter(|b| b.created_at != "-")
+        // Sisa 10 backup valid terbaru (i=3..=12) harus tetap ada
+        for i in 3..=12 {
+            assert!(
+                backups_dir
+                    .join(format!("backup_20261101_{:02}0000_000000000", i))
+                    .exists(),
+                "Valid backup i={} harus tetap ada",
+                i
+            );
+        }
+
+        // Keempat backup rusak TIDAK BOLEH dihapus otomatis
+        assert!(
+            corrupt_manifest_dir.exists(),
+            "Skenario A tidak boleh terhapus"
+        );
+        assert!(corrupt_db_dir.exists(), "Skenario B tidak boleh terhapus");
+        assert!(missing_log_dir.exists(), "Skenario C tidak boleh terhapus");
+        assert!(
+            size_mismatch_dir.exists(),
+            "Skenario D tidak boleh terhapus"
+        );
+
+        // Total folder yang tersisa adalah 10 valid + 4 rusak = 14 direktori
+        let all_folders: Vec<_> = fs::read_dir(&backups_dir)
+            .unwrap()
+            .flatten()
+            .filter(|e| e.path().is_dir())
             .collect();
-        assert_eq!(valid_remaining.len(), 10);
+        assert_eq!(all_folders.len(), 14);
 
         let _ = fs::remove_dir_all(&test_root);
     }
@@ -747,7 +964,11 @@ mod tests {
 
         // 3. File berisi karakter acak bukan SQLite
         let corrupt_file = test_root.join("corrupt.db");
-        fs::write(&corrupt_file, b"This is definitely not an SQLite database header.").unwrap();
+        fs::write(
+            &corrupt_file,
+            b"This is definitely not an SQLite database header.",
+        )
+        .unwrap();
         assert!(BackupService::validate_sqlite_database(&corrupt_file).is_err());
 
         // 4. File SQLite valid
@@ -766,21 +987,16 @@ mod tests {
     #[test]
     fn test_never_touches_user_backup_directory() {
         // Verifikasi bahwa seluruh test environment kita mengarah ke temp_dir
-        let (test_root, backups_dir, manager, conn_arc) = setup_isolated_test_env();
-        let paths = manager.get_paths();
+        let (test_root, backups_dir, _manager, conn_arc) = setup_isolated_test_env();
 
         let user_backups_dir = BackupService::get_backups_dir().unwrap();
         assert_ne!(backups_dir, user_backups_dir);
 
-        let res = BackupService::create_backup_snapshot_in(
-            &conn_arc,
-            &paths.main_db,
-            &paths.log_db,
-            &backups_dir,
-        )
-        .unwrap();
+        let res = BackupService::create_backup_snapshot_in(&conn_arc, &backups_dir).unwrap();
 
-        assert!(!res.path.contains(&user_backups_dir.to_string_lossy().to_string()));
+        assert!(!res
+            .path
+            .contains(&user_backups_dir.to_string_lossy().to_string()));
         assert!(res.path.contains(&test_root.to_string_lossy().to_string()));
 
         let _ = fs::remove_dir_all(&test_root);

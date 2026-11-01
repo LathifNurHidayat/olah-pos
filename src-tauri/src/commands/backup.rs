@@ -9,8 +9,7 @@ pub fn create_database_backup(
     db_manager: State<'_, Arc<DbManager>>,
 ) -> Result<BackupResult, String> {
     let conn = db_manager.get_connection();
-    let paths = db_manager.get_paths();
-    BackupService::create_backup_snapshot(&conn, &paths.main_db, &paths.log_db)
+    BackupService::create_backup_snapshot(&conn)
 }
 
 #[tauri::command]
@@ -24,11 +23,7 @@ pub fn restore_database_backup(
     db_manager: State<'_, Arc<DbManager>>,
 ) -> Result<(), String> {
     let paths = db_manager.get_paths();
-    BackupService::restore_backup_snapshot(
-        Path::new(&backup_folder),
-        &paths.main_db,
-        &paths.log_db,
-    )
+    BackupService::restore_backup_snapshot(Path::new(&backup_folder), &paths.main_db, &paths.log_db)
 }
 
 #[tauri::command]

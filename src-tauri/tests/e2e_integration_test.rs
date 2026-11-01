@@ -5,8 +5,12 @@ use olahpos_lib::services::backup_service::BackupService;
 use olahpos_lib::services::integration_service::IntegrationService;
 use olahpos_lib::services::inventory_service::{InventoryService, StockOpnameInput};
 use olahpos_lib::services::master_service::{MasterService, SaveBarangInput};
-use olahpos_lib::services::printer_service::{PrinterConfig, PrinterService, ReceiptPrintData, ReceiptPrintItem};
-use olahpos_lib::services::purchase_service::{CreatePembelianInput, CreatePembelianItem, PurchaseService};
+use olahpos_lib::services::printer_service::{
+    PrinterConfig, PrinterService, ReceiptPrintData, ReceiptPrintItem,
+};
+use olahpos_lib::services::purchase_service::{
+    CreatePembelianInput, CreatePembelianItem, PurchaseService,
+};
 use olahpos_lib::services::report_service::ReportService;
 use olahpos_lib::services::sales_service::{CartItemInput, CheckoutInput, SalesService};
 use serde_json::json;
@@ -41,7 +45,8 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
         stok_minimum: 10,
         catatan: Some("Produk uji coba e2e".to_string()),
     };
-    let barang_id = MasterService::save_barang(&conn_arc, input_barang, Some(user_id)).expect("Failed to save barang");
+    let barang_id = MasterService::save_barang(&conn_arc, input_barang, Some(user_id))
+        .expect("Failed to save barang");
     assert!(barang_id > 0);
 
     // Seed Supplier Pihak Ketiga
@@ -52,7 +57,8 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
                 created_at, created_by, kode_pihak, nama_pihak, jenis_pihak
             ) VALUES ('2026-01-01T00:00:00Z', 1, 'SUP-E2E-1', 'PT Sumber Harapan', 'PERUSAHAAN');",
             [],
-        ).expect("Failed seed supplier");
+        )
+        .expect("Failed seed supplier");
     }
 
     // 4. Transaksi Pembelian Tunai (Beli 50 botol @ 3.000 = 150.000)
@@ -72,14 +78,19 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
         catatan: Some("Restock awal 50 botol".to_string()),
         user_id: Some(user_id),
     };
-    let pembelian_id = PurchaseService::create_pembelian(&conn_arc, purchase_input).expect("Purchase failed");
+    let pembelian_id =
+        PurchaseService::create_pembelian(&conn_arc, purchase_input).expect("Purchase failed");
     assert!(pembelian_id > 0);
 
     // Cek stok setelah pembelian: 50
     {
         let conn = conn_arc.lock().unwrap();
         let stok: i64 = conn
-            .query_row("SELECT stok_saat_ini FROM mst_barang WHERE barang_id = ?1;", [barang_id], |r| r.get(0))
+            .query_row(
+                "SELECT stok_saat_ini FROM mst_barang WHERE barang_id = ?1;",
+                [barang_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(stok, 50);
 
@@ -111,7 +122,8 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
         catatan: Some("Pelanggan umum".to_string()),
         user_id: Some(user_id),
     };
-    let receipt = SalesService::process_checkout(&conn_arc, checkout_input).expect("Checkout failed");
+    let receipt =
+        SalesService::process_checkout(&conn_arc, checkout_input).expect("Checkout failed");
     assert_eq!(receipt.total_bersih, 25000);
     assert_eq!(receipt.nominal_kembalian, 25000);
     assert_eq!(receipt.status_pembayaran, "SUCCESS");
@@ -120,7 +132,11 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
     {
         let conn = conn_arc.lock().unwrap();
         let stok: i64 = conn
-            .query_row("SELECT stok_saat_ini FROM mst_barang WHERE barang_id = ?1;", [barang_id], |r| r.get(0))
+            .query_row(
+                "SELECT stok_saat_ini FROM mst_barang WHERE barang_id = ?1;",
+                [barang_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(stok, 45);
 
@@ -180,7 +196,8 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
         &midtrans_payload,
         Some("Konfigurasi Sandbox".to_string()),
         Some(user_id),
-    ).expect("Save encrypted config failed");
+    )
+    .expect("Save encrypted config failed");
 
     let loaded_config = IntegrationService::get_config(&conn_arc, "MIDTRANS_QRIS")
         .expect("Fetch config failed")
@@ -196,14 +213,19 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
             keterangan: Some("5 botol pecah di gudang".to_string()),
             user_id: Some(user_id),
         },
-    ).expect("Opname failed");
+    )
+    .expect("Opname failed");
     assert!(opname_id > 0);
 
     // Stok akhir adalah 40
     {
         let conn = conn_arc.lock().unwrap();
         let stok_akhir: i64 = conn
-            .query_row("SELECT stok_saat_ini FROM mst_barang WHERE barang_id = ?1;", [barang_id], |r| r.get(0))
+            .query_row(
+                "SELECT stok_saat_ini FROM mst_barang WHERE barang_id = ?1;",
+                [barang_id],
+                |r| r.get(0),
+            )
             .unwrap();
         assert_eq!(stok_akhir, 40);
     }
@@ -217,19 +239,14 @@ fn test_full_e2e_pos_and_inventory_lifecycle() {
     assert_eq!(dashboard.kas_keluar_hari_ini, 150000);
 
     // 10. Backup Snapshot & Retention (Isolated temp directory)
-    let temp_backup_dir = std::env::temp_dir().join(format!("olahpos_bkp_{}", chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)));
+    let temp_backup_dir = std::env::temp_dir().join(format!(
+        "olahpos_bkp_{}",
+        chrono::Utc::now().timestamp_nanos_opt().unwrap_or(0)
+    ));
     let temp_backups_dest = temp_backup_dir.join("backups");
     let _ = std::fs::create_dir_all(&temp_backups_dest);
-    let dummy_main = temp_backup_dir.join("main.db");
-    let dummy_log = temp_backup_dir.join("log.db");
-    {
-        let conn_main = rusqlite::Connection::open(&dummy_main).unwrap();
-        conn_main.execute("CREATE TABLE test (id INT);", []).unwrap();
-        let conn_log = rusqlite::Connection::open(&dummy_log).unwrap();
-        conn_log.execute("CREATE TABLE test_log (id INT);", []).unwrap();
-    }
 
-    let backup_res = BackupService::create_backup_snapshot_in(&conn_arc, &dummy_main, &dummy_log, &temp_backups_dest)
+    let backup_res = BackupService::create_backup_snapshot_in(&conn_arc, &temp_backups_dest)
         .expect("Backup snapshot failed");
     assert!(backup_res.path.contains("backup_"));
 
